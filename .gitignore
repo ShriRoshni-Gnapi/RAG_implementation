@@ -1,0 +1,18 @@
+# secrets - never commit
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# pipeline data (regenerable, large, and copyrighted source material)
+data/
+reports/
+*.log
+
+# retired vector store
+data/qdrant/

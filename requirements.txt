@@ -1,0 +1,22 @@
+# pt_rag dependencies (Python 3.14)
+#
+#   py -3.14 -m pip install -r requirements.txt
+
+# Document extraction (PDF, DOCX, DOC)
+pymupdf>=1.24
+python-docx>=1.0
+olefile>=0.47
+
+
+# embeddings (all-MiniLM-L6-v2, 384-d)
+sentence-transformers>=3.0
+torch>=2.0
+
+# vector store: Qdrant (server mode, http://localhost:6333)
+qdrant-client>=1.9
+
+# configuration
+python-dotenv>=1.0
+
+# The PostgreSQL/pgvector implementation is retired (see retired_postgres/).
+# psycopg2-binary is no longer required by this pipeline.
