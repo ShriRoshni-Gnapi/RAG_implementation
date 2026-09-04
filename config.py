@@ -54,10 +54,12 @@ def _env(name, default=None):
 QDRANT_URL = _env("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = _env("QDRANT_API_KEY")        # unset for a local server
 QDRANT_TIMEOUT = int(_env("QDRANT_TIMEOUT", "60"))
+QDRANT_COLLECTION = _env("QDRANT_COLLECTION", "pt_books")
 COLLECTION_PREFIX = _env("COLLECTION_PREFIX", "ptbook_")
 
 # Qdrant builds its HNSW index automatically; no index type to choose.
 DISTANCE_METRIC = "cosine"
+
 
 # ---------------------------------------------------------------- embedding
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"       # same model as the transcript project
@@ -309,3 +311,81 @@ def unsupported_files(books_dir=None):
 
 
 BOOKS = discover_books()
+
+
+# ---------------------------------------------------------------- llm / generation
+# Supported env variables (with fallback aliases for NVIDIA Nemotron and legacy MedGemma):
+#   API URL:   NVIDIA_API_URL / AZURE_CNLP_MEDGEMMA__ENDPOINTS__0__API_URL / LLM_API_URL / MEDGEMMA_SERVER_API_URL
+#   Token/Key: NVIDIA_API_TOKEN / NVIDIA_API_KEY / LLM_API_KEY / MEDGEMMA_API_TOKEN
+#   Model:     NVIDIA_MODEL / AZURE_CNLP_MEDGEMMA__ENDPOINTS__0__MODEL / LLM_MODEL / MEDGEMMA_SERVER_MODEL
+LLM_API_URL = _env(
+    "NVIDIA_API_URL",
+    _env("AZURE_CNLP_MEDGEMMA__ENDPOINTS__0__API_URL",
+         _env("LLM_API_URL",
+              _env("MEDGEMMA_SERVER_API_URL",
+                   _env("MEDGEMMA_API_URL",
+                        _env("MEDGEMMA_URL", "http://46.4.179.126:8000/v1")))))
+)
+
+LLM_API_TOKEN = _env(
+    "NVIDIA_API_TOKEN",
+    _env("NVIDIA_API_KEY",
+         _env("LLM_API_KEY",
+              _env("LLM_API_TOKEN",
+                   _env("MEDGEMMA_API_TOKEN",
+                        _env("MEDGEMMA_API_KEY",
+                             _env("MEDGEMMA_TOKEN", ""))))))
+)
+
+LLM_MODEL = _env(
+    "NVIDIA_MODEL",
+    _env("AZURE_CNLP_MEDGEMMA__ENDPOINTS__0__MODEL",
+         _env("LLM_MODEL",
+              _env("MEDGEMMA_SERVER_MODEL",
+                   _env("MEDGEMMA_MODEL",
+                        _env("MEDGEMMA_MODEL_NAME", "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4")))))
+)
+
+LLM_TIMEOUT = int(_env("LLM_TIMEOUT", _env("NVIDIA_TIMEOUT", _env("MEDGEMMA_TIMEOUT", "180"))))
+LLM_TEMPERATURE = float(_env("LLM_TEMPERATURE", _env("NVIDIA_TEMPERATURE", _env("MEDGEMMA_TEMPERATURE", "0.2"))))
+LLM_MAX_TOKENS = int(_env("LLM_MAX_TOKENS", _env("NVIDIA_MAX_TOKENS", _env("MEDGEMMA_MAX_TOKENS", "4096"))))
+
+
+
+# Aliases for backwards compatibility with any existing scripts
+MEDGEMMA_SERVER_API_URL = LLM_API_URL
+MEDGEMMA_API_TOKEN = LLM_API_TOKEN
+MEDGEMMA_SERVER_MODEL = LLM_MODEL
+MEDGEMMA_TIMEOUT = LLM_TIMEOUT
+MEDGEMMA_TEMPERATURE = LLM_TEMPERATURE
+MEDGEMMA_MAX_TOKENS = LLM_MAX_TOKENS
+
+
+def get_llm_config():
+    """Return current active LLM (NVIDIA / OpenAI-compatible) settings as a dict."""
+    return {
+        "api_url": LLM_API_URL,
+        "api_token": LLM_API_TOKEN,
+        "model": LLM_MODEL,
+        "timeout": LLM_TIMEOUT,
+        "temperature": LLM_TEMPERATURE,
+        "max_tokens": LLM_MAX_TOKENS,
+    }
+
+
+def get_medgemma_config():
+    """Backwards-compatible alias for get_llm_config."""
+    return get_llm_config()
+
+
+def get_qdrant_config():
+    """Return current active Qdrant settings as a dict."""
+    return {
+        "url": QDRANT_URL,
+        "api_key": QDRANT_API_KEY,
+        "timeout": QDRANT_TIMEOUT,
+        "collection": QDRANT_COLLECTION,
+        "collection_prefix": COLLECTION_PREFIX,
+    }
+
+

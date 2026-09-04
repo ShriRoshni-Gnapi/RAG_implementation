@@ -77,34 +77,24 @@ def show(hit, rank):
 def run_queries(queries, book_key=None, top_k=TOP_K, all_books=False, save_to=None):
     client = qdrant_store.get_client()
     try:
-        if all_books:
-            names = qdrant_store.list_collections(client)
-            if not names:
-                raise SystemExit(
-                    "No collections found.\n"
-                    "  Run ingestion first:  py -3.14 main.py <book_key>")
-        else:
-            if not book_key:
-                raise SystemExit(
-                    "No book specified.\n"
-                    "  Specify a book:  py -3.14 retrieve_test.py <book_key>\n"
-                    "  Or search all:   py -3.14 retrieve_test.py --all-books")
-            names = [qdrant_store.collection_name(book_key)]
-            if not client.collection_exists(names[0]):
-                raise SystemExit(
-                    f"Collection '{names[0]}' does not exist.\n"
-                    f"  Run ingestion first:  py -3.14 main.py {book_key}")
-
-        total = sum(qdrant_store.count_points(client, n) for n in names)
-        if total == 0:
-            target = "collections" if all_books else f"collection '{names[0]}'"
+        from config import QDRANT_COLLECTION
+        if not client.collection_exists(QDRANT_COLLECTION):
             raise SystemExit(
-                f"{target} contain no points.\n"
-                f"  Run ingestion first:  py -3.14 main.py {book_key or '<book_key>'}")
+                f"Collection '{QDRANT_COLLECTION}' not found.\n"
+                f"  Run migration first:  py -3.14 migrate_to_single_collection.py")
 
+        target_book = None if all_books else book_key
+        total = qdrant_store.count_points(client, QDRANT_COLLECTION, book_id=target_book)
+        if total == 0:
+            target_desc = f"book '{book_key}'" if target_book else f"collection '{QDRANT_COLLECTION}'"
+            raise SystemExit(
+                f"No points found for {target_desc}.\n"
+                f"  Run migration/ingestion:  py -3.14 main.py {book_key or '--all'}")
+
+        scope_desc = f"All 25 Ingested Books" if all_books or not book_key else f"Book: {book_key}"
         print("=" * 100)
-        print(f"RETRIEVAL TEST  |  qdrant @ {QDRANT_URL}")
-        print(f"collections={', '.join(names)}  points={total}  "
+        print(f"RETRIEVAL TEST  |  qdrant @ {QDRANT_URL}  |  collection={QDRANT_COLLECTION}")
+        print(f"scope={scope_desc}  points={total:,}  "
               f"model={EMBEDDING_MODEL}  top_k={top_k}")
         print("=" * 100)
 
@@ -113,12 +103,9 @@ def run_queries(queries, book_key=None, top_k=TOP_K, all_books=False, save_to=No
         for qi, q in enumerate(queries, 1):
             t0 = time.time()
             qv = model.encode(q, normalize_embeddings=True).tolist()
-            hits = []
-            for n in names:
-                hits.extend(qdrant_store.search(client, n, qv, limit=top_k))
-            hits.sort(key=lambda h: h["score"], reverse=True)
-            hits = hits[:top_k]
+            hits = qdrant_store.search(client, QDRANT_COLLECTION, qv, limit=top_k, book_id=target_book)
             ms = (time.time() - t0) * 1000
+
 
             print(f"\n[{qi}] Question:")
             print(f"    {q}")
@@ -162,7 +149,8 @@ def run_queries(queries, book_key=None, top_k=TOP_K, all_books=False, save_to=No
                 json.dump({
                     "vector_store": "qdrant",
                     "qdrant_url": QDRANT_URL,
-                    "collections": names,
+                    "collection": QDRANT_COLLECTION,
+                    "book_id": target_book,
                     "points": total,
                     "embedding_model": EMBEDDING_MODEL,
                     "top_k": top_k,
@@ -170,6 +158,7 @@ def run_queries(queries, book_key=None, top_k=TOP_K, all_books=False, save_to=No
                 }, f, indent=1, ensure_ascii=False)
             print(f"\nSaved -> {save_to}")
         return results_out
+
     finally:
         client.close()
 

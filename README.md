@@ -1,17 +1,41 @@
-# pt_rag — PT Textbook RAG Pipeline
+# pt_rag — PT Textbook RAG & NVIDIA Nemotron Clinical Assistant
 
-Turns a physiotherapy textbook PDF into a searchable, citable vector index
-backed by **Qdrant** (server mode, `http://localhost:6333`).
+Turns a physiotherapy textbook library into a citable, hallucination-resistant
+clinical question-answering system powered by **Qdrant** vector store and **NVIDIA Nemotron** (`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4`).
 
 ```text
-PDF → extract → clean → structure → chunk → all-MiniLM-L6-v2 (384-d)
-    → Qdrant → retrieve relevant chunks
+PDF / DOCX → extract → clean → structure → token-aware chunk → all-MiniLM-L6-v2 (384-d)
+           → Qdrant Server → top-k hits + provenance [1], [2]
+           → NVIDIA Nemotron Inference → Grounded Clinical Answer + Verified Citations
 ```
 
-MedGemma is **not** part of this pipeline yet. This stage validates everything
-up to and including retrieval.
+---
+
+## ⚡ Quick Start: Ask Questions
+
+Ask questions across the entire textbook library or against a specific book:
+
+```powershell
+cd "c:\Users\Shri Roshni\Downloads\References and Books\pt_rag"
+
+# 1. Ask a question across all 25 ingested textbooks
+py -3.14 ask.py "What are the precautions for mobilizing a patient with deep vein thrombosis?"
+
+# 2. Start an interactive conversational clinical assistant session
+py -3.14 ask.py --interactive
+
+# 3. Check Qdrant & NVIDIA server connectivity
+py -3.14 ask.py --check-api
+
+# 4. Search within a specific book
+py -3.14 ask.py --book paz_acute_care "What are the normal arterial blood gas ranges?"
+
+# 5. Run end-to-end benchmark evaluation
+py -3.14 eval_rag.py
+```
 
 ---
+
 
 ## 1. Start the Qdrant server
 
@@ -43,12 +67,25 @@ Or in a browser:
 - **Dashboard / collection browser:** <http://localhost:6333/dashboard>
 - REST: <http://localhost:6333/collections>
 
-## 3. Collections
+## 3. Vector Collection Architecture
 
-Nothing to pre-create. One collection per book is created during ingestion,
-named `<COLLECTION_PREFIX><book_key>` — e.g. `ptbook_paz_acute_care`.
+All 25 physiotherapy books are consolidated into **one unified Qdrant collection**: `pt_books`.
 
-Vectors: **384-d, COSINE distance**. Qdrant builds its own HNSW index.
+* Vectors: **384-d, COSINE distance**.
+* Payload Indexes: Keyword indexes on `book_id`, `content_type`, and `subject_area`.
+* Retrieval: Fast single-query search across all 62,278 chunks (`pt_books`) or book-filtered search (`--book <book_id>`).
+* Ingestion & Upsert: Deterministic UUIDv5 point IDs ensure idempotency without duplicate points.
+
+To migrate/consolidate books or re-verify:
+
+```powershell
+# Run the automated migration and validation suite
+py -3.14 migrate_to_single_collection.py
+
+# Run all 6 automated validation tests
+py -3.14 test_single_collection.py
+```
+
 
 ## 4. Environment variables
 

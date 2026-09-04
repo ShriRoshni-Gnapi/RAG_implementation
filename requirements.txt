@@ -18,5 +18,9 @@ qdrant-client>=1.9
 # configuration
 python-dotenv>=1.0
 
+# API Gateway Server (FastAPI + Uvicorn)
+fastapi>=0.110.0
+uvicorn>=0.28.0
+
 # The PostgreSQL/pgvector implementation is retired (see retired_postgres/).
 # psycopg2-binary is no longer required by this pipeline.

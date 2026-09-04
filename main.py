@@ -116,12 +116,13 @@ def preflight():
     print("-" * 40)
     try:
         import qdrant_store
-        from config import QDRANT_URL
-        print(f"target: {QDRANT_URL}")
+        from config import QDRANT_URL, QDRANT_COLLECTION
+        print(f"target: {QDRANT_URL} (collection: {QDRANT_COLLECTION})")
         client = qdrant_store.get_client()
         try:
-            cols = qdrant_store.list_collections(client)
-            print(f"{OK} Qdrant reachable ({len(cols)} existing collection(s))")
+            qdrant_store.ensure_collection(client, QDRANT_COLLECTION)
+            pts = qdrant_store.count_points(client, QDRANT_COLLECTION)
+            print(f"{OK} Qdrant reachable ({pts:,} points in '{QDRANT_COLLECTION}')")
         finally:
             client.close()
         return True
@@ -129,6 +130,7 @@ def preflight():
         print(f"\n{BAD} Vector store preflight failed")
         print(f"Error: {e}")
         return False
+
 
 
 def main(book_key):
@@ -261,7 +263,7 @@ def run_all(keys=None):
 
 def verify():
     """
-    Cross-check every book: chunks on disk vs points actually in Qdrant.
+    Cross-check every book: chunks on disk vs points actually in Qdrant (pt_books).
 
     Worth having because a collection can end up empty *after* a successful
     ingestion (a later re-create, a manual command, a wiped volume) and nothing
@@ -269,24 +271,25 @@ def verify():
     """
     import json
     import qdrant_store
-    from config import CHUNKS_DIR, EXCLUDED_CONTENT_TYPES
+    from config import CHUNKS_DIR, EXCLUDED_CONTENT_TYPES, QDRANT_COLLECTION
 
     client = qdrant_store.get_client()
     try:
+        print(f"Collection : {QDRANT_COLLECTION}")
         print(f"{'book_key':<32} {'expected':>9} {'stored':>8}  status")
         print("-" * 70)
         problems, total = [], 0
         for key in BOOKS:
             path = CHUNKS_DIR / f"{key}_chunks.json"
+            stored = qdrant_store.count_points(client, QDRANT_COLLECTION, book_id=key)
+            total += stored
             if not path.exists():
-                print(f"{key:<32} {'-':>9} {'-':>8}  not ingested")
+                state = f"{OK} indexed ({stored:,} pts)" if stored > 0 else "not on disk / not indexed"
+                print(f"{key:<32} {'-':>9} {stored:>8,}  {state}")
                 continue
             chunks = json.load(open(path, encoding="utf-8"))
             expected = sum(1 for c in chunks
                            if c["content_type"] not in EXCLUDED_CONTENT_TYPES)
-            name = qdrant_store.collection_name(key)
-            stored = qdrant_store.count_points(client, name)
-            total += stored
             if stored == expected and expected > 0:
                 state = f"{OK} ok"
             elif stored == 0:
@@ -302,10 +305,11 @@ def verify():
             print(f"\n{len(problems)} book(s) need attention: {', '.join(problems)}")
             print("Fix with:  py -3.14 embed_store.py <book_key>")
             return 1
-        print(f"\n{OK} All {len(BOOKS)} books consistent.")
+        print(f"\n{OK} All {len(BOOKS)} books verified in '{QDRANT_COLLECTION}'.")
         return 0
     finally:
         client.close()
+
 
 
 def _stage_ingest(key):
@@ -320,9 +324,13 @@ def _stage_embed(key):
 
 def _usage():
     print("Usage:")
-    print("  py -3.14 main.py <book_key>     run one book")
-    print("  py -3.14 main.py --all          run every book in the books folder")
-    print("  py -3.14 main.py --list         show discovered books\n")
+    print("  py -3.14 main.py <book_key>             run full ingestion pipeline for one book")
+    print("  py -3.14 main.py --all                  ingest every book in the books folder")
+    print("  py -3.14 main.py --list                 show discovered books in the library")
+    print("  py -3.14 main.py --verify               cross-check chunks on disk vs Qdrant")
+    print("  py -3.14 main.py --ask \"<question>\"    ask a question with LLM RAG")
+    print("  py -3.14 main.py --interactive         start interactive clinical assistant chat")
+    print("  py -3.14 main.py --check-api           check Qdrant & LLM server status\n")
     print("Registered book keys:")
     for key, meta in BOOKS.items():
         print(f"  - {key:32} {meta['title'][:44]}")
@@ -340,7 +348,28 @@ if __name__ == "__main__":
         sys.exit(run_all())
     if arg in ("--verify", "-v"):
         sys.exit(verify())
+    if arg in ("--interactive", "-i"):
+        from ask import interactive_mode
+        interactive_mode()
+        sys.exit(0)
+    if arg in ("--check-api", "-c"):
+        from ask import check_api_connectivity
+        check_api_connectivity()
+        sys.exit(0)
+    if arg in ("--ask", "-q"):
+        if len(sys.argv) < 3:
+            print("Error: Please provide a question after --ask, e.g.:")
+            print('  py -3.14 main.py --ask "What are the precautions for mobilizing a patient with DVT?"')
+            sys.exit(2)
+        from query_engine import PTQueryEngine
+        from ask import display_result
+        engine = PTQueryEngine()
+        q_text = " ".join(sys.argv[2:])
+        res = engine.query(question=q_text, all_books=True)
+        display_result(res)
+        sys.exit(0)
     if arg in ("-h", "--help"):
         _usage()
         sys.exit(0)
     sys.exit(main(arg))
+

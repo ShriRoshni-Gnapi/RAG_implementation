@@ -70,15 +70,15 @@ def main(book_key):
             f"ABORT: model produces {dim}-d vectors but EMBEDDING_DIM is "
             f"{EMBEDDING_DIM}. Update config.py and re-create the collection.")
 
-    name = qdrant_store.collection_name(book_key)
+    name = qdrant_store.collection_name()
     print(f"\nQdrant         : {QDRANT_URL}")
     print(f"Collection     : {name} ({DISTANCE_METRIC})")
+    print(f"Book ID        : {book_key}")
 
     client = qdrant_store.get_client()
     try:
-        # Rebuild from scratch so a re-run can never leave stale points behind.
-        qdrant_store.ensure_collection(client, name, dim, recreate=True)
-        print("collection ready (0 points)")
+        # Ensure collection and payload indexes exist without dropping other books
+        qdrant_store.ensure_collection(client, name, dim, recreate=False)
 
         texts = [c["text"] for c in indexable]
         print(f"\nEmbedding {len(texts)} chunks (batch={EMBED_BATCH_SIZE}, CPU) ...")
@@ -92,19 +92,22 @@ def main(book_key):
         print(f"embedded in {elapsed:.1f}s  ({len(texts)/elapsed:.1f} chunks/s)")
         print(f"vector shape   : {vectors.shape}")
 
-        print("\nUpserting into Qdrant ...")
+        print(f"\nUpserting into Qdrant '{name}' ...")
         t1 = time.time()
         sent = qdrant_store.insert_chunks(client, name, book_key,
                                           indexable, vectors)
         insert_s = time.time() - t1
-        stored = qdrant_store.count_points(client, name)
+        stored_book = qdrant_store.count_points(client, name, book_id=book_key)
+        stored_total = qdrant_store.count_points(client, name)
         print(f"upserted points: {sent} in {insert_s:.1f}s")
-        print(f"points in coll : {stored}")
+        print(f"points for book: {stored_book}")
+        print(f"total in coll  : {stored_total}")
 
-        if stored != len(indexable):
+        if stored_book != len(indexable):
             raise SystemExit(
-                f"ABORT: stored {stored} points but expected {len(indexable)}. "
-                f"The collection may contain stale or duplicated data.")
+                f"ABORT: stored {stored_book} points for {book_key} but expected {len(indexable)}. "
+                f"Check ingestion payload and logs.")
+
 
         report = {
             "book_id": book_key,
