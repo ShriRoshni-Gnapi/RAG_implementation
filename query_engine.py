@@ -21,8 +21,6 @@ import os
 import time
 from typing import Dict, List, Optional, Any, Callable
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-
 import qdrant_store
 from config import (
     EMBEDDING_MODEL,

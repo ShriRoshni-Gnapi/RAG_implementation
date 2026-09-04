@@ -71,6 +71,16 @@ class ChatCompletionRequest(BaseModel):
     top_k: Optional[int] = 5
 
 
+@app.on_event("startup")
+def startup_event():
+    """Pre-load embedding model on startup so first request has zero cold-start delay."""
+    try:
+        from query_engine import get_embedding_model
+        get_embedding_model()
+    except Exception as e:
+        print(f"Warning: Failed to pre-load embedding model on startup: {e}")
+
+
 @app.get("/health")
 def health_check():
     """Check connectivity to Qdrant vector DB and NVIDIA LLM server."""
@@ -132,7 +142,9 @@ def ask_pt(req: AskRequest):
             total_ms=res["total_ms"],
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Query error: {str(e)}")
 
 
 @app.post("/v1/chat/completions")
@@ -153,40 +165,46 @@ def openai_chat_completions(req: ChatCompletionRequest):
     if not user_query:
         raise HTTPException(status_code=400, detail="No user message found in request.")
 
-    res = engine.query(
-        question=user_query,
-        top_k=req.top_k or 5,
-        temperature=req.temperature,
-        max_tokens=req.max_tokens,
-    )
+    try:
+        res = engine.query(
+            question=user_query,
+            top_k=req.top_k or 5,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+        )
 
-    full_content = res["formatted_output"]
-    created_ts = int(time.time())
-    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        full_content = res["formatted_output"]
+        created_ts = int(time.time())
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-    return {
-        "id": chat_id,
-        "object": "chat.completion",
-        "created": created_ts,
-        "model": res["model"],
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": full_content,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
-    }
+        return {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": res["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": full_content,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8008)
+
