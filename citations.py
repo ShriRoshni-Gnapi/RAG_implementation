@@ -130,9 +130,6 @@ def render_citation_entry(hit: Dict[str, Any], index: Optional[int] = None) -> D
     else:
         formatted_lines.append(f"    {page_str}")
 
-    if source_file:
-        formatted_lines.append(f"    Source: {source_file} (PDF page {pdf_page_start})")
-
     return {
         "index": index or 0,
         "book": book,
