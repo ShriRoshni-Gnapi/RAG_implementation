@@ -150,33 +150,59 @@ def render_citation_entry(hit: Dict[str, Any], index: Optional[int] = None) -> D
     }
 
 
-def extract_source_labels(text: str, num_hits: int) -> List[int]:
+def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int, List[int]]:
     """
-    Source numbers the model named in reference mode ("Source 3: ...").
+    Reference mode: {source number: picked sentence numbers} from the model's
+    reply ("Source 3: 2, 4").
 
-    Out-of-range numbers are dropped, so a label the model made up can never
-    reach the printed list.
+    A source or sentence number outside what was shown is dropped, so a label
+    the model made up can never reach the printed list. A source named with
+    no valid sentence numbers maps to [] and is printed in full instead.
     """
-    found = {int(n) for n in re.findall(r"Source\s*(\d+)", text or "", re.I)}
-    return sorted(i for i in found if 1 <= i <= num_hits)
+    parts = re.split(r"Source\s*(\d+)", text or "", flags=re.I)
+    out: Dict[int, List[int]] = {}
+    for num, body in zip(parts[1::2], parts[2::2]):
+        idx = int(num)
+        if not (1 <= idx <= len(sentence_counts)) or idx in out:
+            continue
+        picked = {int(n) for n in re.findall(r"\d+", body)}
+        out[idx] = sorted(k for k in picked if 1 <= k <= sentence_counts[idx - 1])
+    return out
 
 
-def format_reference_list(hits: List[Dict[str, Any]], indices: List[int]) -> str:
+def _join_sentences(sentences: List[str], picked: List[int]) -> str:
+    """Picked sentences exactly as stored; '[...]' marks a skipped stretch."""
+    pieces, prev = [], None
+    for k in picked:
+        if prev is not None and k != prev + 1:
+            pieces.append("[...]")
+        pieces.append(sentences[k - 1])
+        prev = k
+    return " ".join(pieces)
+
+
+def format_reference_list(
+    hits: List[Dict[str, Any]],
+    sentences: List[List[str]],
+    picks: Dict[int, List[int]],
+) -> str:
     """
-    Combined reference list for the chosen sources, written from stored
-    metadata (book, author, chapter, section, pages) and the stored passage
-    text. Nothing here comes from the model's wording.
+    Combined reference list written entirely from stored data: book, author,
+    chapter, section and pages from metadata, and the excerpt as the stored
+    sentences the model picked, unchanged. The model never writes any text
+    that is printed. A source with no valid sentence numbers shows its full
+    stored passage.
     """
-    if not indices:
+    if not picks:
         return NO_REFERENCE_TEXT
 
     blocks = []
-    for n, idx in enumerate(indices, 1):
-        hit = hits[idx - 1]
-        entry = render_citation_entry(hit, idx)
-        passage = " ".join((hit.get("content") or hit.get("text") or "").split())
+    for n, idx in enumerate(sorted(picks), 1):
+        entry = render_citation_entry(hits[idx - 1], idx)
+        chosen = picks[idx] or list(range(1, len(sentences[idx - 1]) + 1))
+        excerpt = _join_sentences(sentences[idx - 1], chosen)
         head = entry["formatted_text"].replace("• ", "", 1)
-        blocks.append(f"{n}. {head}\n    Passage: {passage}")
+        blocks.append(f"{n}. {head}\n    Excerpt: {excerpt}")
     return "\n\n".join(blocks)
 
 

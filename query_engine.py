@@ -37,9 +37,12 @@ from prompts import (
     assemble_context,
     build_user_prompt,
     build_reference_user_prompt,
+    assemble_numbered_context,
+    hit_text,
+    split_sentences,
 )
 from citations import (
-    extract_source_labels,
+    extract_source_sentences,
     format_reference_list,
     validate_citations,
     render_citation_entry,
@@ -260,30 +263,31 @@ class PTQueryEngine:
         """
         SOAP note -> combined list of relevant textbook references.
 
-        The model only chooses which retrieved passages are relevant. The
-        printed list is built from stored metadata and passage text, so a
-        book title, author, chapter or page can never be invented.
+        Extractive: the model only picks which numbered sentences of which
+        retrieved passages are relevant. Everything printed (book details and
+        excerpt sentences) is stored text, so nothing from outside the books
+        and no invented title, author, chapter or page can appear.
         """
         t0 = time.time()
         hits = self.retrieve_for_note(soap_note, top_k=top_k, max_sources=max_sources)
         retrieval_ms = (time.time() - t0) * 1000
 
+        sentences = [split_sentences(hit_text(h)) for h in hits]
         raw_answer, model = "", self.client.model
         if hits:
-            # max_chars sized so no retrieved passage is dropped from the prompt
-            context_text = assemble_context(hits, max_chars=len(hits) * 3000)
             gen = self.client.generate(
                 system_prompt=REFERENCE_SYSTEM_PROMPT,
-                user_prompt=build_reference_user_prompt(soap_note, context_text),
+                user_prompt=build_reference_user_prompt(
+                    soap_note, assemble_numbered_context(hits, sentences)),
                 temperature=0.0,
             )
             raw_answer = gen.get("text", "")
             model = gen.get("model", model)
 
-        indices = extract_source_labels(raw_answer, len(hits))
+        picks = extract_source_sentences(raw_answer, [len(s) for s in sentences])
         return {
-            "references": format_reference_list(hits, indices) if hits else NO_REFERENCE_TEXT,
-            "source_indices": indices,
+            "references": format_reference_list(hits, sentences, picks),
+            "source_indices": sorted(picks),
             "retrieved_count": len(hits),
             "raw_answer": raw_answer,
             "model": model,

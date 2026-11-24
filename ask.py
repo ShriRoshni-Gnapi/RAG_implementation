@@ -176,6 +176,7 @@ def main():
     parser.add_argument("--soap-file", "-s", metavar="PATH",
                         help="SOAP note text file ('-' reads stdin); prints only the matching textbook references")
 
+
     args = parser.parse_args()
 
     if args.soap_file:

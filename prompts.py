@@ -8,6 +8,7 @@ Implements the Expert Hybrid prompt architecture:
   * Clinical safety bounds
 """
 
+import re
 from typing import List, Dict, Any, Optional
 
 PROMPT_VERSION = "prompt_v4.0_expert_hybrid"
@@ -134,7 +135,7 @@ Instructions:
 2. Identify important clinical terms, symptoms, examination findings and assessment concepts.
 3. Match these concepts against the retrieved textbook passages.
 4. Return only references directly relevant to the complete SOAP note.
-5. Include book title, author, chapter, section, page number and relevant supporting passage.
+5. For each reference identify the relevant supporting sentences of the passage by their numbers. The system adds the book title, author, chapter, section and page number, and prints those sentences.
 6. Do not mention which SOAP section a reference belongs to.
 7. Do not generate diagnoses, treatment plans, clinical advice or additional explanations.
 8. Do not use your own medical knowledge to create references.
@@ -146,13 +147,38 @@ Output only a combined list of relevant textbook references."""
 NO_REFERENCE_TEXT = "No matching reference was found."
 
 
+def hit_text(hit: Dict[str, Any]) -> str:
+    """The stored passage text of a retrieved chunk, whitespace normalised."""
+    return " ".join((hit.get("content") or hit.get("text") or "").split())
+
+
+def split_sentences(text: str) -> List[str]:
+    """
+    Split a passage into sentences. The same split numbers the sentences shown
+    to the model and prints the ones it picks, so a number always means the
+    same text.
+    """
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z(\d])", " ".join((text or "").split()))
+    return [p for p in parts if p]
+
+
+def assemble_numbered_context(hits: List[Dict[str, Any]], sentences: List[List[str]]) -> str:
+    """Reference blocks with every sentence numbered, for sentence picking."""
+    blocks = []
+    for i, (hit, sents) in enumerate(zip(hits, sentences), 1):
+        lines = "\n".join(f"  ({k}) {s}" for k, s in enumerate(sents, 1))
+        blocks.append(f"{format_source_header(hit, i)}\n{lines}")
+    return "\n\n".join(blocks)
+
+
 def build_reference_user_prompt(soap_note: str, context_text: str) -> str:
     """
-    User message for reference mode: the retrieved passages plus the SOAP note.
+    User message for reference mode: the numbered passages plus the SOAP note.
 
-    The "Source N" label is requested so the caller can map each reference
-    back to a retrieved passage and print its book details from stored
-    metadata, instead of trusting the model to retype titles and page numbers.
+    The model only returns "Source N: sentence numbers". The caller prints
+    each source's book details from stored metadata and the picked sentences
+    exactly as stored, so nothing in the list is written by the model and
+    nothing from outside the books can appear.
     """
     return f"""RETRIEVED TEXTBOOK PASSAGES:
 ═════════════════════════════════════════════════════════════
@@ -162,6 +188,6 @@ def build_reference_user_prompt(soap_note: str, context_text: str) -> str:
 SOAP NOTE:
 {soap_note}
 
-Return the combined list of relevant references. Begin each reference with its source label exactly as written above (for example "Source 3"), then give the book title, author, chapter, section, page number and the supporting passage taken from that source. Write "not recorded" for any detail the source does not show. If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
+Return the combined list of relevant references. Write one line per reference: the source label exactly as written above, then the numbers of that source's sentences that directly support it, separated by commas (for example "Source 3: 2, 4"). Write only the label and the numbers: no book details and no other words. If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
 
 
