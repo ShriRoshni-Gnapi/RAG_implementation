@@ -38,10 +38,10 @@ from prompts import (
     build_user_prompt,
     build_reference_user_prompt,
     assemble_numbered_context,
-    hit_text,
-    split_sentences,
 )
+from passages import build_vocab, hit_text, sentences_for, split_text
 from citations import (
+    build_reference_entries,
     extract_source_sentences,
     format_reference_list,
     validate_citations,
@@ -67,32 +67,113 @@ def get_embedding_model():
 NOTE_SEGMENT_CHARS = 500
 
 
+# "S:", "O:", "A:", "P:" or "Subjective:" ... at the start of a line.
+_SECTION_MARK = re.compile(
+    r"(?m)^[ \t]*(?:(?i:(subjective|objective|assessment|plan))[ \t]*[:\-–]|([SOAP])[ \t]*:)[ \t]*"
+)
+
+
+def parse_soap_sections(note: str) -> List[tuple]:
+    """
+    [(label, text)] for a SOAP note, label in S/O/A/P, or '' for text outside
+    any marker. A note with no markers is one '' section, so it still works.
+    """
+    marks = list(_SECTION_MARK.finditer(note))
+    if not marks:
+        return [("", note.strip())] if note.strip() else []
+    sections = []
+    lead = note[:marks[0].start()].strip()
+    if lead:
+        sections.append(("", lead))
+    for i, m in enumerate(marks):
+        label = (m.group(1) or m.group(2))[0].upper()
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(note)
+        body = note[m.end():end].strip()
+        if body:
+            sections.append((label, body))
+    return sections
+
+
+def _wrap(unit: str, max_chars: int) -> List[str]:
+    """Cut one over-long unit at word boundaries, never inside a word."""
+    out, cur = [], ""
+    for word in unit.split():
+        if cur and len(cur) + len(word) + 1 > max_chars:
+            out.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}".strip()
+    return out + ([cur] if cur else [])
+
+
 def split_note(text: str, max_chars: int = NOTE_SEGMENT_CHARS) -> List[str]:
     """
-    Cut a long note into pieces the embedding model reads in full.
+    Cut a section into search queries the embedding model reads in full.
 
-    Searching with the whole note would silently use only its first ~256
-    tokens, so the rest of the note would never influence retrieval.
+    Searching with the whole text would silently use only its first ~256
+    tokens. Pieces end at sentence or clause boundaries (never inside a
+    word), and each piece repeats the last unit of the one before it, so a
+    finding is not separated from the context next to it.
     """
-    pieces, cur = [], ""
-    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
-        sentence = sentence.strip()
-        while len(sentence) > max_chars:          # one very long sentence
-            if cur:
-                pieces.append(cur)
-                cur = ""
-            pieces.append(sentence[:max_chars])
-            sentence = sentence[max_chars:].strip()
-        if not sentence:
-            continue
-        if cur and len(cur) + len(sentence) + 1 > max_chars:
-            pieces.append(cur)
-            cur = sentence
-        else:
-            cur = f"{cur} {sentence}".strip()
+    units = []
+    for line in text.splitlines():
+        for sentence in split_text(line):
+            units.extend(u.strip() for u in re.split(r";\s+", sentence) if u.strip())
+
+    pieces: List[str] = []
+    cur: List[str] = []
+
+    def size(parts: List[str]) -> int:
+        return sum(len(p) for p in parts) + max(0, len(parts) - 1)
+
+    for unit in (w for u in units for w in _wrap(u, max_chars)):
+        if cur and size(cur + [unit]) > max_chars:
+            pieces.append(" ".join(cur))
+            cur = [cur[-1]] if size([cur[-1], unit]) <= max_chars else []
+        cur.append(unit)
     if cur:
-        pieces.append(cur)
+        pieces.append(" ".join(cur))
     return pieces
+
+
+def build_queries(sections: List[tuple], max_chars: int = NOTE_SEGMENT_CHARS):
+    """
+    (pieces, weights) for every section. Each section's pieces share a total
+    weight of 1, so a long Objective section cannot drown out a short
+    Subjective or Assessment section.
+    """
+    pieces: List[str] = []
+    weights: List[float] = []
+    for _, body in sections:
+        section_pieces = split_note(body, max_chars)
+        pieces.extend(section_pieces)
+        weights.extend([1.0 / len(section_pieces)] * len(section_pieces))
+    return pieces, weights
+
+
+def fuse_ranked_hits(
+    result_lists: List[List[Dict[str, Any]]],
+    weights: List[float],
+    rrf_k: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Reciprocal-rank fusion of the per-query results.
+
+    A passage that several parts of the note retrieve outranks one that a
+    single phrase retrieved, so passages that fit the note as a whole come
+    first. Each hit keeps its best cosine score in 'score' and gets 'fused'.
+    Ties break on score then chunk id so the order is repeatable.
+    """
+    fused: Dict[str, float] = {}
+    best: Dict[str, Dict[str, Any]] = {}
+    for hits, weight in zip(result_lists, weights):
+        for rank, hit in enumerate(sorted(hits, key=lambda h: h["score"], reverse=True), 1):
+            key = hit.get("chunk_id") or hit_text(hit)
+            fused[key] = fused.get(key, 0.0) + weight / (rrf_k + rank)
+            if key not in best or hit["score"] > best[key]["score"]:
+                best[key] = hit
+    ranked = sorted(best, key=lambda k: (-fused[k], -best[k]["score"], k))
+    return [{**best[k], "fused": round(fused[k], 6)} for k in ranked]
 
 
 class PTQueryEngine:
@@ -234,24 +315,34 @@ class PTQueryEngine:
         }
 
 
+    def _search_pieces(self, pieces: List[str], top_k: int) -> List[List[Dict[str, Any]]]:
+        """One Qdrant search per query piece (one connection, one batch encode)."""
+        vectors = get_embedding_model().encode(pieces, normalize_embeddings=True).tolist()
+        client = qdrant_store.get_client()
+        try:
+            return [
+                qdrant_store.search(client=client, name=None, query_vector=v, limit=top_k)
+                for v in vectors
+            ]
+        finally:
+            client.close()
+
     def retrieve_for_note(
         self,
-        note: str,
+        sections: List[tuple],
         top_k: Optional[int] = None,
         max_sources: int = 12,
     ) -> List[Dict[str, Any]]:
         """
-        Search every segment of the note, merge by chunk (best score wins) and
-        keep the strongest passages. Unlike query(), a passage below min_score
-        is never kept as a fallback: no strong match means no reference.
+        Search every piece of every section, fuse the rankings and keep the
+        strongest passages. A passage under min_score (the engine's existing
+        floor, not re-tuned for this mode) is never kept as a fallback.
         """
-        best: Dict[str, Dict[str, Any]] = {}
-        for piece in split_note(note):
-            for hit in self.retrieve_chunks(piece, all_books=True, top_k=top_k):
-                key = hit.get("chunk_id") or hit.get("content") or ""
-                if key not in best or hit["score"] > best[key]["score"]:
-                    best[key] = hit
-        ranked = sorted(best.values(), key=lambda h: h["score"], reverse=True)
+        pieces, weights = build_queries(sections)
+        if not pieces:
+            return []
+        results = self._search_pieces(pieces, top_k or self.top_k)
+        ranked = fuse_ranked_hits(results, weights)
         return [h for h in ranked if h["score"] >= self.min_score][:max_sources]
 
     def find_references(
@@ -269,25 +360,43 @@ class PTQueryEngine:
         and no invented title, author, chapter or page can appear.
         """
         t0 = time.time()
-        hits = self.retrieve_for_note(soap_note, top_k=top_k, max_sources=max_sources)
+        # Plan text is not used: the task reads S, O and A and gives no treatment.
+        sections = [(label, body) for label, body in parse_soap_sections(soap_note) if label != "P"]
+        hits = self.retrieve_for_note(sections, top_k=top_k, max_sources=max_sources)
         retrieval_ms = (time.time() - t0) * 1000
 
-        sentences = [split_sentences(hit_text(h)) for h in hits]
+        vocab = build_vocab(hit_text(h) for h in hits)
+        numbered = [(h, sentences_for(hit_text(h), vocab)) for h in hits]
+        numbered = [(h, s) for h, s in numbered if s]          # passages with no usable sentence
+        hits = [h for h, _ in numbered]
+        sentences = [s for _, s in numbered]
+
         raw_answer, model = "", self.client.model
         if hits:
+            note_for_model = "\n".join(body for _, body in sections)
             gen = self.client.generate(
                 system_prompt=REFERENCE_SYSTEM_PROMPT,
                 user_prompt=build_reference_user_prompt(
-                    soap_note, assemble_numbered_context(hits, sentences)),
+                    note_for_model, assemble_numbered_context(hits, sentences)),
                 temperature=0.0,
             )
             raw_answer = gen.get("text", "")
             model = gen.get("model", model)
 
         picks = extract_source_sentences(raw_answer, [len(s) for s in sentences])
+        entries = build_reference_entries(hits, sentences, picks)
+        shown = sorted({i for e in entries for i in e["sources"]})
         return {
-            "references": format_reference_list(hits, sentences, picks),
-            "source_indices": sorted(picks),
+            "references": format_reference_list(entries),
+            "source_indices": sorted(i for i, p in picks.items() if p),
+            "dropped_sources": sorted(i for i, p in picks.items() if not p),
+            "reference_entries": entries,
+            "candidates": [
+                {"source": i, "chunk_id": h.get("chunk_id"), "book": h.get("book_title"),
+                 "score": round(h["score"], 4), "fused": h.get("fused"),
+                 "picked": i in picks and bool(picks[i]), "printed": i in shown}
+                for i, h in enumerate(hits, 1)
+            ],
             "retrieved_count": len(hits),
             "raw_answer": raw_answer,
             "model": model,

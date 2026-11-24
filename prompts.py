@@ -8,7 +8,6 @@ Implements the Expert Hybrid prompt architecture:
   * Clinical safety bounds
 """
 
-import re
 from typing import List, Dict, Any, Optional
 
 PROMPT_VERSION = "prompt_v4.0_expert_hybrid"
@@ -147,26 +146,16 @@ Output only a combined list of relevant textbook references."""
 NO_REFERENCE_TEXT = "No matching reference was found."
 
 
-def hit_text(hit: Dict[str, Any]) -> str:
-    """The stored passage text of a retrieved chunk, whitespace normalised."""
-    return " ".join((hit.get("content") or hit.get("text") or "").split())
-
-
-def split_sentences(text: str) -> List[str]:
+def assemble_numbered_context(hits: List[Dict[str, Any]], sentences: List[List[Any]]) -> str:
     """
-    Split a passage into sentences. The same split numbers the sentences shown
-    to the model and prints the ones it picks, so a number always means the
-    same text.
+    Reference blocks with every sentence numbered, for sentence picking.
+
+    `sentences` holds passages.Sentence items. The same numbering is used to
+    print the picked sentences, so a number always means the same text.
     """
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z(\d])", " ".join((text or "").split()))
-    return [p for p in parts if p]
-
-
-def assemble_numbered_context(hits: List[Dict[str, Any]], sentences: List[List[str]]) -> str:
-    """Reference blocks with every sentence numbered, for sentence picking."""
     blocks = []
     for i, (hit, sents) in enumerate(zip(hits, sentences), 1):
-        lines = "\n".join(f"  ({k}) {s}" for k, s in enumerate(sents, 1))
+        lines = "\n".join(f"  ({k}) {s.text}" for k, s in enumerate(sents, 1))
         blocks.append(f"{format_source_header(hit, i)}\n{lines}")
     return "\n\n".join(blocks)
 
@@ -188,6 +177,7 @@ def build_reference_user_prompt(soap_note: str, context_text: str) -> str:
 SOAP NOTE:
 {soap_note}
 
-Return the combined list of relevant references. Write one line per reference: the source label exactly as written above, then the numbers of that source's sentences that directly support it, separated by commas (for example "Source 3: 2, 4"). Write only the label and the numbers: no book details and no other words. If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
+Return the combined list of relevant references. Write one line per reference: the source label exactly as written above, then the numbers of that source's sentences that directly support a finding in the note, separated by commas (for example "Source 3: 2, 4"). Write only the label and the numbers: no book details and no other words.
+Be strict. Include a source only if its sentences are about the same condition, body region and kind of finding as the note. Leave out a source that merely shares a term (for example "stairs", "swelling" or "pain") but describes a different condition, patient group or procedure. A short list is better than a long one. If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
 
 

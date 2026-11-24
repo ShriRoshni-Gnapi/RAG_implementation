@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Set, Tuple, Optional
 
 from config import BOOKS_DIR, BOOKS
+from passages import Sentence
 from prompts import NO_REFERENCE_TEXT
 
 DISCLAIMER_TEXT = (
@@ -155,9 +156,10 @@ def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int,
     Reference mode: {source number: picked sentence numbers} from the model's
     reply ("Source 3: 2, 4").
 
-    A source or sentence number outside what was shown is dropped, so a label
-    the model made up can never reach the printed list. A source named with
-    no valid sentence numbers maps to [] and is printed in full instead.
+    Every source and sentence number is checked against what was actually
+    shown, so an id the model made up can never reach the printed list. Ranges
+    such as "2-4" are expanded. A source named with no valid sentence number
+    maps to [] and the caller drops it: nothing is shown for it.
     """
     parts = re.split(r"Source\s*(\d+)", text or "", flags=re.I)
     out: Dict[int, List[int]] = {}
@@ -165,44 +167,162 @@ def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int,
         idx = int(num)
         if not (1 <= idx <= len(sentence_counts)) or idx in out:
             continue
-        picked = {int(n) for n in re.findall(r"\d+", body)}
+        picked: Set[int] = set()
+        for lo, hi, single in re.findall(r"(\d+)\s*[-–]\s*(\d+)|(\d+)", body):
+            if single:
+                picked.add(int(single))
+            elif int(lo) <= int(hi) <= int(lo) + 50:
+                picked.update(range(int(lo), int(hi) + 1))
         out[idx] = sorted(k for k in picked if 1 <= k <= sentence_counts[idx - 1])
     return out
 
 
-def _join_sentences(sentences: List[str], picked: List[int]) -> str:
-    """Picked sentences exactly as stored; '[...]' marks a skipped stretch."""
-    pieces, prev = [], None
+# --------------------------------------------------------------------------
+# Reference list: grouping, metadata and printing (all from stored data)
+# --------------------------------------------------------------------------
+
+_CUT = "[...]"
+_CHAPTER_LABEL = re.compile(r"^(?:chapter|ch\.?)\s+\w+|^\d{1,3}\b", re.I)
+_JUNK_LABEL = re.compile(r"^(?:scan|page|img|image)\d+$", re.I)
+_MISSING = (None, "", "None")
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _clean_label(value: Any) -> Optional[str]:
+    """A stored outline label, or None when it is missing or scanner junk."""
+    if value in _MISSING or _JUNK_LABEL.match(str(value).strip()):
+        return None
+    return str(value).strip()
+
+
+def chapter_and_section(hit: Dict[str, Any], title: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Chapter and section as stored. The outline path is used to find the real
+    chapter (a book's root entry is often stored in the chapter field); labels
+    that are missing or scanner junk ('scan0023') are not shown.
+    """
+    path = [p.strip() for p in (hit.get("section_path") or "").split(">") if p.strip()]
+    for i, label in enumerate(path):
+        if _CHAPTER_LABEL.match(label):
+            rest = [p for p in path[i + 1:] if _clean_label(p)]
+            return label, " > ".join(rest) or None
+
+    chapter = _clean_label(hit.get("chapter"))
+    if chapter and _norm(chapter) == _norm(title):
+        chapter = None                                  # root entry = the book itself
+    rest = [v for v in (_clean_label(hit.get("section")), _clean_label(hit.get("subsection"))) if v]
+    return chapter, " > ".join(dict.fromkeys(rest)) or None
+
+
+def page_text(hit: Dict[str, Any]) -> str:
+    """
+    Pages as stored. The stored range belongs to the whole section the passage
+    sits in, not to the passage itself, so a range is labelled as such.
+    """
+    start, end = hit.get("page_start"), hit.get("page_end")
+    if start in _MISSING and end in _MISSING:
+        return "Pages: not recorded"
+    start, end = (start if start not in _MISSING else end), (end if end not in _MISSING else start)
+    if str(start) == str(end):
+        return f"Page: {start}"
+    return f"Pages: {start}–{end} (section range)"
+
+
+def _excerpt(sentences: List[Sentence], picked: List[int]) -> str:
+    """Picked sentences exactly as stored; '[...]' marks skipped or cut text."""
+    pieces: List[str] = []
+    prev = None
     for k in picked:
+        s = sentences[k - 1]
         if prev is not None and k != prev + 1:
-            pieces.append("[...]")
-        pieces.append(sentences[k - 1])
+            pieces.append(_CUT)
+        text = s.text
+        if s.cut_start and not (pieces and pieces[-1] == _CUT):
+            text = f"{_CUT} {text}"
+        if s.cut_end:
+            text = f"{text} {_CUT}"
+        pieces.append(text)
         prev = k
     return " ".join(pieces)
 
 
-def format_reference_list(
+def _is_repeat(sentence: str, printed: List[str]) -> bool:
+    """True when this sentence already appears in text printed for the same book."""
+    norm = _norm(sentence)
+    return not norm or any(norm in p for p in printed)
+
+
+def build_reference_entries(
     hits: List[Dict[str, Any]],
-    sentences: List[List[str]],
+    sentences: List[List[Sentence]],
     picks: Dict[int, List[int]],
-) -> str:
+) -> List[Dict[str, Any]]:
     """
-    Combined reference list written entirely from stored data: book, author,
-    chapter, section and pages from metadata, and the excerpt as the stored
-    sentences the model picked, unchanged. The model never writes any text
-    that is printed. A source with no valid sentence numbers shows its full
-    stored passage.
+    Reference entries from the validated picks.
+
+    Passages from the same book, chapter and section share one entry (one
+    heading, one excerpt per passage, in book order). Different sections of
+    the same chapter stay separate entries. A sentence already printed for
+    the same book (overlapping chunks) is not printed twice.
     """
-    if not picks:
+    groups: Dict[tuple, Dict[str, Any]] = {}
+    for idx in sorted(i for i, p in picks.items() if p):
+        hit = hits[idx - 1]
+        meta = BOOKS.get(hit.get("book_id", ""), {})
+        title = hit.get("book_title") or hit.get("book") or meta.get("title") or "Unknown book"
+        chapter, section = chapter_and_section(hit, title)
+        key = (hit.get("book_id") or title, chapter, section)
+        group = groups.setdefault(key, {
+            "book": title,
+            "author": hit.get("author") or meta.get("author"),
+            "chapter": chapter,
+            "section": section,
+            "pages": page_text(hit),
+            "passages": [],
+        })
+        group["passages"].append((hit.get("chunk_id") or "", idx))
+
+    entries: List[Dict[str, Any]] = []
+    printed: Dict[str, List[str]] = {}
+    for key, group in groups.items():
+        seen = printed.setdefault(str(key[0]), [])
+        excerpts, chunk_ids, sources = [], [], []
+        for chunk_id, idx in sorted(group.pop("passages")):
+            kept = []
+            for k in picks[idx]:
+                if not _is_repeat(sentences[idx - 1][k - 1].text, seen):
+                    kept.append(k)
+                    seen.append(_norm(sentences[idx - 1][k - 1].text))
+            if kept:
+                excerpts.append(_excerpt(sentences[idx - 1], kept))
+                chunk_ids.append(chunk_id)
+                sources.append(idx)
+        if excerpts:
+            entries.append({**group, "excerpts": excerpts, "chunk_ids": chunk_ids, "sources": sources})
+    return sorted(entries, key=lambda e: min(e["sources"]))
+
+
+def format_reference_list(entries: List[Dict[str, Any]]) -> str:
+    """
+    One combined reference list: title, author (if known), chapter, section
+    (if known), pages, and the original textbook sentences. Nothing in it is
+    written by the model.
+    """
+    if not entries:
         return NO_REFERENCE_TEXT
 
     blocks = []
-    for n, idx in enumerate(sorted(picks), 1):
-        entry = render_citation_entry(hits[idx - 1], idx)
-        chosen = picks[idx] or list(range(1, len(sentences[idx - 1]) + 1))
-        excerpt = _join_sentences(sentences[idx - 1], chosen)
-        head = entry["formatted_text"].replace("• ", "", 1)
-        blocks.append(f"{n}. {head}\n    Excerpt: {excerpt}")
+    for n, e in enumerate(entries, 1):
+        lines = [f"{n}. {e['book']}"]
+        for label, value in (("Author", e["author"]), ("Chapter", e["chapter"]), ("Section", e["section"])):
+            if value:
+                lines.append(f"    {label}: {value}")
+        lines.append(f"    {e['pages']}")
+        lines.extend(f"    Excerpt: {x}" for x in e["excerpts"])
+        blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
 
