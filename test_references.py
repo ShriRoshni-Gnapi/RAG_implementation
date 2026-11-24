@@ -19,6 +19,7 @@ import re
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 try:                                    # unit tests need no Qdrant server
@@ -32,7 +33,10 @@ except ImportError:
         sys.modules[_name] = _m
 
 import ask
+import passages
+import qdrant_store
 import query_engine as qe
+import summaries
 from citations import (
     build_reference_entries, chapter_and_section, citation_line, extract_source_sentences,
     format_reference_list, page_text, selection_reply_usable,
@@ -909,6 +913,118 @@ class SupportingBehaviour(unittest.TestCase):
         for key in ("references", "source_indices", "retrieved_count", "raw_answer",
                     "model", "retrieval_ms", "total_ms"):
             self.assertIn(key, out)
+
+
+# --------------------------------------------------------------------------
+# Qdrant request failures, and the generator version
+# --------------------------------------------------------------------------
+
+QDRANT_SECRET = "SECRET-IN-A-QDRANT-ERROR-5521"
+
+try:                                    # the real client's error classes, when it is installed
+    import httpx
+    from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+    REAL_QDRANT_ERRORS = [
+        ResponseHandlingException(Exception(f"boom {QDRANT_SECRET}")),
+        UnexpectedResponse(status_code=500, reason_phrase="x", content=b"", headers=httpx.Headers()),
+    ]
+except Exception:
+    REAL_QDRANT_ERRORS = []
+
+
+class FakeQdrant:
+    """A Qdrant client whose two calls can fail: exists_error / query_error."""
+
+    def __init__(self, exists_error=None, query_error=None, exists=True, points=()):
+        self.exists_error, self.query_error, self.exists, self.points = exists_error, query_error, exists, points
+
+    def collection_exists(self, name):
+        if self.exists_error:
+            raise self.exists_error
+        return self.exists
+
+    def query_points(self, **kw):
+        if self.query_error:
+            raise self.query_error
+        return SimpleNamespace(points=list(self.points))
+
+    def close(self):
+        pass
+
+
+class QdrantRequestFailures(unittest.TestCase):
+    VECTOR = [0.0] * 384
+
+    def errors(self):
+        return [TimeoutError(f"read timed out {QDRANT_SECRET}"), ConnectionResetError(f"reset {QDRANT_SECRET}"),
+                *REAL_QDRANT_ERRORS]
+
+    def test_a_request_that_fails_after_connecting_is_a_vector_store_error(self):
+        for error in self.errors():
+            for stage in ("exists_error", "query_error"):
+                with self.subTest(error=type(error).__name__, stage=stage):
+                    with self.assertRaises(qdrant_store.VectorStoreError) as caught:
+                        qdrant_store.search(FakeQdrant(**{stage: error}), None, self.VECTOR)
+                    self.assertEqual(str(caught.exception), f"Qdrant request failed ({type(error).__name__}).")
+                    self.assertNotIn(QDRANT_SECRET, str(caught.exception))       # only the type is kept
+                    self.assertIs(caught.exception.__cause__, error)
+
+    def test_a_missing_collection_keeps_its_own_message(self):
+        with self.assertRaises(qdrant_store.VectorStoreError) as caught:
+            qdrant_store.search(FakeQdrant(exists=False), None, self.VECTOR)
+        self.assertIn("does not exist in Qdrant", str(caught.exception))
+
+    def test_an_unrelated_error_is_not_turned_into_unavailable(self):
+        with self.assertRaises(ValueError):
+            qdrant_store.search(FakeQdrant(query_error=ValueError("a bug")), None, self.VECTOR)
+
+    def test_a_successful_search_still_returns_rows(self):
+        point = SimpleNamespace(payload={"book": "B", "text": "T", "chunk_id": "c"}, score=0.5)
+        rows = qdrant_store.search(FakeQdrant(points=[point]), None, self.VECTOR)
+        self.assertEqual(rows, [{"book": "B", "text": "T", "chunk_id": "c",
+                                 "book_title": "B", "content": "T", "score": 0.5}])
+
+
+class GeneratorVersion(unittest.TestCase):
+
+    def test_format_and_stability(self):
+        version = qe.generator_fingerprint()
+        self.assertRegex(version, r"^pt-rag-references-r\d+-[0-9a-f]{8}$")
+        self.assertEqual(version, qe.generator_fingerprint())
+        self.assertEqual(version, qe.GENERATOR_VERSION)
+
+    def test_it_changes_when_any_hashed_input_changes(self):
+        base = qe.generator_fingerprint()
+        zebra = re.compile("^Zebra")
+        changes = [
+            (qe, "REFERENCE_SYSTEM_PROMPT", "changed"), (qe, "SUMMARY_SYSTEM_PROMPT", "changed"),
+            (qe, "build_reference_user_prompt", lambda note, context: "changed"),
+            (qe, "build_summary_user_prompt", lambda passage, focus=None: "changed"),
+            (qe, "MAX_SENTENCES_PER_SOURCE", 99), (qe, "NOTE_SEGMENT_CHARS", 123), (qe, "SUMMARY_MAX_TOKENS", 1),
+            (qe, "EMBEDDING_MODEL", "another-model"), (qe, "GENERATOR_REVISION", 999),
+            (passages, "MAX_SENTENCE_CHARS", 401), (passages, "_DEPENDENT_START", zebra),
+            (passages, "_ABBREVIATIONS", frozenset({"zzz"})), (passages, "_MIN_HEAD_WORD_LETTERS", 9),
+            (summaries, "MIN_SHARED_STEMS", 5), (summaries, "_CONCLUSION", zebra),
+            (summaries, "_COMMON", frozenset({"zzz"})), (summaries, "MIN_UNIT_CHARS", 99),
+        ]
+        for module, name, value in changes:
+            with self.subTest(change=f"{module.__name__}.{name}"):
+                with mock.patch.object(module, name, value):
+                    self.assertNotEqual(qe.generator_fingerprint(), base)
+        with mock.patch.object(qe.PTQueryEngine.__init__, "__defaults__", (7, 0.5, None)):
+            self.assertNotEqual(qe.generator_fingerprint(), base)            # top_k / min_score
+        with mock.patch.object(qe.fuse_ranked_hits, "__defaults__", (30,)):
+            self.assertNotEqual(qe.generator_fingerprint(), base)            # rrf_k
+        self.assertEqual(qe.generator_fingerprint(), base)                  # every patch was undone
+
+    def test_every_pattern_and_limit_in_the_rule_modules_is_hashed(self):
+        for module in (passages, summaries):
+            listed = set(module._RULE_NAMES)
+            found = {name for name, value in vars(module).items()
+                     if isinstance(value, (re.Pattern, frozenset))
+                     or (isinstance(value, (int, float)) and not isinstance(value, bool))}
+            self.assertEqual(found - listed, set(), f"{module.__name__}: add these to _RULE_NAMES")
+            self.assertEqual(listed - found, set(), f"{module.__name__}: not a pattern or limit")
 
 
 # --------------------------------------------------------------------------

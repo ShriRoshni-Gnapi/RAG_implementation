@@ -36,6 +36,17 @@ class VectorStoreError(RuntimeError):
     """Any connection/collection problem, reported with a fix."""
 
 
+# What Qdrant's client raises when a request fails after the connection was made:
+# UnexpectedResponse and ResponseHandlingException (timeouts, resets, HTTP errors)
+# both derive from ApiException; a raw socket failure is an OSError. A stubbed or
+# older client without those classes falls back to OSError alone.
+try:
+    from qdrant_client.http.exceptions import ApiException
+    QDRANT_ERRORS = (ApiException, OSError)
+except ImportError:
+    QDRANT_ERRORS = (OSError,)
+
+
 # --------------------------------------------------------------------------
 # Connection
 # --------------------------------------------------------------------------
@@ -237,19 +248,27 @@ def search(client: QdrantClient, name: Optional[str], query_vector: List[float],
             f"Query vector must have {EMBEDDING_DIM} dimensions, got "
             f"{0 if query_vector is None else len(query_vector)}")
 
-    if not client.collection_exists(target_name):
+    # A request that fails after the connection was made (timeout, reset, HTTP error) is a
+    # VectorStoreError too, so a caller treats it like any other "Qdrant is unavailable"
+    # and not as a bug. Only the exception's type is kept in the message.
+    try:
+        exists = client.collection_exists(target_name)
+        if exists:
+            res = client.query_points(
+                collection_name=target_name,
+                query=[float(x) for x in query_vector],
+                limit=limit,
+                query_filter=_build_filter(book_id, content_types),
+                with_payload=True,
+            )
+    except QDRANT_ERRORS as e:
+        raise VectorStoreError(f"Qdrant request failed ({type(e).__name__}).") from e
+
+    if not exists:
         raise VectorStoreError(
             f"Collection '{target_name}' does not exist in Qdrant.\n"
             f"  Run migration/ingestion: py -3.14 migrate_to_single_collection.py"
         )
-
-    res = client.query_points(
-        collection_name=target_name,
-        query=[float(x) for x in query_vector],
-        limit=limit,
-        query_filter=_build_filter(book_id, content_types),
-        with_payload=True,
-    )
     out = []
     for p in res.points:
         row = dict(p.payload or {})

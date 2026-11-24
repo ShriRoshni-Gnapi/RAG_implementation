@@ -192,3 +192,22 @@ def _units(line: str) -> List[Tuple[str, str]]:
     if tail.strip():
         units.append([tail.strip(), ""])
     return [(text, tag) for text, tag in units]
+
+
+# Every pattern and limit above that decides which summary statements are kept. They are
+# hashed into the generator version (query_engine.generator_fingerprint). A new pattern
+# or limit must be added here; a test fails if one is missing.
+_RULE_NAMES = (
+    "_TAG", "_LEAD_PUNCT", "_NUMBER", "_WORD", "_ACRONYM_OR_NAME", "_SENTENCE_START", "_CONCLUSION",
+    "MIN_UNIT_CHARS", "MIN_SHARED_STEMS", "_STEM", "_COMMON",
+)
+
+
+def rules() -> tuple:
+    """The summary rules' patterns and limits, in a stable form for hashing."""
+    out = []
+    for name in _RULE_NAMES:
+        value = globals()[name]
+        out.append((name, value.pattern if isinstance(value, re.Pattern)
+                    else sorted(value) if isinstance(value, frozenset) else value))
+    return tuple(out)

@@ -17,6 +17,8 @@ Flow:
   Grounded Clinical Answer + Verifiable Source Citations
 """
 
+import hashlib
+import json
 import os
 import re
 import time
@@ -43,6 +45,8 @@ from prompts import (
     build_reference_user_prompt,
     assemble_numbered_context,
 )
+import passages as _passages
+import summaries as _summaries
 from passages import hit_text, sentences_for, split_text
 from citations import (
     build_reference_entries,
@@ -76,9 +80,10 @@ NOTE_SEGMENT_CHARS = 500
 # server's model emits before them.
 SUMMARY_MAX_TOKENS = 1500
 
-# Stored with every generated set so a caller can tell which prompts and filters
-# produced it. Change it whenever the prompts, sentence filters or summary checks change.
-GENERATOR_VERSION = "pt-rag-references-1"
+# Part of the generator version below. Bump it by hand only for a change in code logic
+# that the fingerprint cannot see: the fingerprint hashes the prompts and the rules'
+# patterns and limits, not the code that applies them.
+GENERATOR_REVISION = 2
 
 # "S:", "O:", "A:", "P:" or "Subjective:" ... at the start of a line.
 _SECTION_MARK = re.compile(
@@ -494,3 +499,35 @@ def ask_question(
     """Convenience one-call helper."""
     engine = PTQueryEngine(top_k=top_k)
     return engine.query(question=question, book_key=book_key, all_books=all_books)
+
+
+def generator_fingerprint() -> str:
+    """
+    A version string for what produces a reference set: 'pt-rag-references-r2-1a2b3c4d'.
+
+    The hash covers both system prompts, both user-prompt templates, the sentence and
+    summary rules' patterns and limits, and the retrieval settings. It changes by itself
+    when any of them changes, so a caller that stores sets can tell which are stale.
+    A change in code logic is not hashed: bump GENERATOR_REVISION for that.
+    """
+    parts = (
+        REFERENCE_SYSTEM_PROMPT,
+        SUMMARY_SYSTEM_PROMPT,
+        build_reference_user_prompt("{note}", "{passages}"),
+        build_summary_user_prompt("{passage}", [1, 2]),
+        build_summary_user_prompt("{passage}", None),
+        MAX_SENTENCES_PER_SOURCE,
+        NOTE_SEGMENT_CHARS,
+        SUMMARY_MAX_TOKENS,
+        EMBEDDING_MODEL,
+        PTQueryEngine.__init__.__defaults__,            # top_k, min_score
+        fuse_ranked_hits.__defaults__,                  # rrf_k
+        _passages.rules(),
+        _summaries.rules(),
+    )
+    digest = hashlib.sha256(json.dumps(parts, sort_keys=True, default=repr).encode("utf-8")).hexdigest()[:8]
+    return f"pt-rag-references-r{GENERATOR_REVISION}-{digest}"
+
+
+# Stored with every generated set so a caller can tell which prompts and rules produced it.
+GENERATOR_VERSION = generator_fingerprint()

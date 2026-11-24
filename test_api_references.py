@@ -13,6 +13,8 @@ import contextlib
 import io
 import json
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 try:
     from fastapi.testclient import TestClient
@@ -222,6 +224,49 @@ class UnusableModelReplies(unittest.TestCase):
         self.assertEqual((r.status_code, body["status"]), (200, "ready"))
         self.assertEqual(body["references"][0]["summary"], [tr.GOOD_SUMMARY])
         self.assertEqual(body["references"][0]["sentences"], [tr.S1, tr.S2])
+
+
+class FakeEmbeddingModel:
+    def encode(self, pieces, normalize_embeddings=True):
+        return SimpleNamespace(tolist=lambda: [[0.0] * 384 for _ in pieces])
+
+
+@unittest.skipUnless(HAVE_API, "fastapi, httpx and qdrant-client are needed for the route tests")
+class QdrantFailuresAtTheRoute(unittest.TestCase):
+    """The real search path runs (store -> engine -> route); only the Qdrant client and the embedder are fake."""
+
+    def setUp(self):
+        self.client = TestClient(api.app)
+        self.original_engine = api.engine
+        api.engine = tr.qe.PTQueryEngine(client=tr.FakeLLM("Source 1: 1"))
+
+    def tearDown(self):
+        api.engine = self.original_engine
+
+    def post(self, qdrant):
+        out = io.StringIO()
+        with mock.patch.object(tr.qe, "get_embedding_model", return_value=FakeEmbeddingModel()), \
+                mock.patch.object(tr.qe.qdrant_store, "get_client", return_value=qdrant), \
+                contextlib.redirect_stdout(out):
+            r = self.client.post("/references", json={"subjective": f"Knee pain on stairs. {NOTE_MARKER}"})
+        self.assertNotIn(NOTE_MARKER, r.text)
+        self.assertNotIn(NOTE_MARKER, out.getvalue())
+        return r, out.getvalue()
+
+    def test_a_failure_after_connecting_is_503_not_500(self):
+        errors = [TimeoutError(f"read timed out {NOTE_MARKER}"), ConnectionResetError("reset"),
+                  *tr.REAL_QDRANT_ERRORS]
+        for error in errors:
+            for stage in ("exists_error", "query_error"):
+                with self.subTest(error=type(error).__name__, stage=stage):
+                    r, _ = self.post(tr.FakeQdrant(**{stage: error}))
+                    self.assertEqual((r.status_code, r.json()),
+                                     (503, {"detail": "The reference service is unavailable (VectorStoreError)."}))
+
+    def test_a_real_bug_is_still_a_generic_500(self):
+        r, log = self.post(tr.FakeQdrant(query_error=ValueError(f"bug {NOTE_MARKER}")))
+        self.assertEqual((r.status_code, r.json()), (500, {"detail": "The reference lookup failed."}))
+        self.assertIn("ValueError", log)
 
 
 if __name__ == "__main__":

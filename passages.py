@@ -257,3 +257,25 @@ def sentences_for(text: str) -> List[Sentence]:
         )
         for i, f in enumerate(frags)
     ]
+
+
+# Every pattern and limit above that decides which sentences are offered. They are
+# hashed into the generator version (query_engine.generator_fingerprint), so a stored
+# reference set can be recognised as made by different rules. A new pattern or limit
+# must be added here; a test fails if one is missing.
+_RULE_NAMES = (
+    "_ABBREVIATIONS", "_BOUNDARY", "_TERMINAL", "_BULLET", "_REFERENCE_NUMBERS", "_NUMBER_THEN_HEAD",
+    "_HEAD_THEN_NUMBER", "_MIN_HEAD_LETTERS", "_MIN_HEAD_WORD_LETTERS", "_CAPS_RUN_ANY", "_CHAPTER_START",
+    "_HEADING_THEN_SENTENCE", "_TITLE_RUN", "_JOINER", "_DEPENDENT_START", "_SELF_CONTAINED_THIS", "_EMPTY_IT",
+    "_QUESTION", "MAX_SENTENCE_CHARS", "_RUN_ON_MIN_CHARS", "_RUN_ON_JUMPS", "_CASE_JUMP",
+)
+
+
+def rules() -> tuple:
+    """The sentence rules' patterns and limits, in a stable form for hashing."""
+    out = []
+    for name in _RULE_NAMES:
+        value = globals()[name]
+        out.append((name, value.pattern if isinstance(value, re.Pattern)
+                    else sorted(value) if isinstance(value, frozenset) else value))
+    return tuple(out)
