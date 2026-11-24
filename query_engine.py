@@ -355,10 +355,11 @@ class PTQueryEngine:
 
     def _summarize(self, entry: Dict[str, Any], passages: List[List[Any]]):
         """
-        (paragraphs, rejected, raw reply) for one citation: the model sees the
-        complete retrieved passage(s) behind it, numbered, and every paragraph
-        it writes is checked against that text. A failed call gives no summary.
-        The raw reply is returned so a missing summary can be explained.
+        (paragraphs, rejected, raw reply, passage sentences) for one citation:
+        the model sees the complete retrieved passage(s) behind it, numbered,
+        and every statement it writes is checked against that text. A failed
+        call gives no summary. The raw reply and the numbered passage are
+        returned so a summary can be checked, or a missing one explained.
         """
         texts = [s.text for idx in entry["sources"] for s in passages[idx - 1]]
         numbered = "\n".join(f"({k}) {t}" for k, t in enumerate(texts, 1))
@@ -370,9 +371,9 @@ class PTQueryEngine:
                 max_tokens=SUMMARY_MAX_TOKENS,
             ).get("text", "")
         except LLMError as e:
-            return [], [{"paragraph": "", "reason": f"summary call failed: {type(e).__name__}"}], ""
+            return [], [{"paragraph": "", "reason": f"summary call failed: {type(e).__name__}"}], "", texts
         paragraphs, rejected = parse_summary(reply, texts)
-        return paragraphs, rejected, reply
+        return paragraphs, rejected, reply, texts
 
     def find_references(
         self,
@@ -432,7 +433,8 @@ class PTQueryEngine:
         summary_notes: List[Dict[str, Any]] = []
         if summaries:
             for n, entry in enumerate(entries, 1):
-                entry["summary"], notes, entry["summary_raw"] = self._summarize(entry, passages)
+                (entry["summary"], notes, entry["summary_raw"],
+                 entry["summary_passage"]) = self._summarize(entry, passages)
                 summary_notes.extend({"citation": n, **note} for note in notes)
         return {
             "references": format_reference_list(entries, with_summary=summaries),

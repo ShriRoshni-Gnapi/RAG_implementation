@@ -2,18 +2,22 @@
 Checks for the model-written 'Detailed Summary' of a cited passage.
 
 The summary is the only text in reference mode that the model writes, so it is
-held to the passage. The model must end every paragraph with the numbers of the
-passage sentences it rests on, and each paragraph is kept only when
+held to the passage. The model marks the passage sentences each statement rests
+on with numbers in square brackets, either after every sentence or at the end
+of a paragraph ("... on stairs [1]. ... is common [2, 3]."). The text before
+each bracket is one unit, and a unit is kept only when
 
-  * those numbers exist,
+  * the numbers in its bracket exist,
   * every number it states appears in the passage,
   * every name or acronym it uses appears in the passage,
   * it shares real vocabulary with the sentences it cites, and
   * it is not a copy of an original sentence.
 
-A paragraph that fails any check is dropped, never repaired. If none survive,
-no summary is printed. These checks catch invented figures, names and
-unsupported topics. They cannot prove that a paraphrase is faithful.
+A unit that fails any check is dropped, never repaired, and a paragraph with no
+unit left is dropped. If nothing survives, no summary is printed. The brackets
+are removed from the text. These checks catch invented figures, names and
+unsupported topics. They cannot prove that a paraphrase is faithful, or that an
+added explanation of a term comes from the passage and not from the model.
 """
 
 import re
@@ -21,14 +25,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from prompts import INSUFFICIENT_TEXT
 
-# "... leg strength. [2, 5]" or "[S2-S4]" at the end of a paragraph.
-_TAG = re.compile(r"\[\s*([Ss\d,\s\-–]+?)\s*\]\s*$")
+# "[2, 5]", "[S2-S4]" anywhere in a paragraph.
+_TAG = re.compile(r"\[\s*([Ss\d,\s\-–]+?)\s*\]")
+_LEAD_PUNCT = re.compile(r"^\s*([.,;:!?]+)")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 _WORD = re.compile(r"[A-Za-z]+")
 _ACRONYM_OR_NAME = re.compile(r"\b(?:[A-Z]{2,}[a-z]?|[A-Z][a-z]{2,})\b")
 _SENTENCE_START = re.compile(r"(?:^|(?<=[.!?])\s+)\S+")
 
-MIN_PARAGRAPH_CHARS = 40
+MIN_UNIT_CHARS = 25
 MIN_SHARED_STEMS = 2
 _STEM = 5
 _COMMON = frozenset({
@@ -72,7 +77,7 @@ def _reject_reason(text: str, ids: List[int], sentences: List[str], passage: str
                    passage_words: set, passage_numbers: set) -> Optional[str]:
     if not ids:
         return "no valid sentence numbers"
-    if len(text) < MIN_PARAGRAPH_CHARS:
+    if len(text) < MIN_UNIT_CHARS:
         return "too short"
     norm = _norm(text)
     if any(len(s) > 40 and _norm(s) in norm for s in sentences):
@@ -95,7 +100,8 @@ def parse_summary(reply: str, sentences: List[str]) -> Tuple[List[str], List[Dic
     (paragraphs, rejected) from the model's summary reply.
 
     `sentences` are the numbered passage sentences the model was shown.
-    `rejected` lists each dropped paragraph with its reason, for debugging.
+    `rejected` lists each dropped unit (text before a bracket) with its
+    reason, for debugging.
     """
     if not (reply or "").strip():
         return [], [{"paragraph": "", "reason": "empty reply from the model"}]
@@ -111,15 +117,41 @@ def parse_summary(reply: str, sentences: List[str]) -> Tuple[List[str], List[Dic
         line = line.strip().lstrip("-*• ").strip()
         if not line:
             continue
-        tag = _TAG.search(line)
-        if not tag:
-            rejected.append({"paragraph": line, "reason": "no sentence numbers at the end"})
-            continue
-        text = line[:tag.start()].strip()
-        reason = _reject_reason(text, _evidence_ids(tag.group(1), len(sentences)), sentences,
-                                passage, passage_words, passage_numbers)
-        if reason:
-            rejected.append({"paragraph": text, "reason": reason})
-        else:
-            kept.append(text)
+        good: List[str] = []
+        for text, tag in _units(line):
+            reason = _reject_reason(text, _evidence_ids(tag, len(sentences)), sentences,
+                                    passage, passage_words, passage_numbers)
+            if reason:
+                rejected.append({"paragraph": text, "reason": reason})
+            else:
+                good.append(text if re.search(r"[.!?]$", text) else f"{text}.")
+        if good:
+            kept.append(" ".join(good))
     return kept, rejected
+
+
+def _units(line: str) -> List[Tuple[str, str]]:
+    """
+    [(text, bracket numbers)] for one paragraph line. The text before each
+    bracket is a unit; punctuation right after a bracket goes back to the unit
+    it ends; a bracket with no text before it (a closing "[1, 2, 3]") adds
+    nothing; text after the last bracket is a unit with no numbers.
+    """
+    pieces = _TAG.split(line)                    # text, numbers, text, numbers, ..., text
+    units: List[List[str]] = []
+    for i in range(0, len(pieces) - 1, 2):
+        text, tag = pieces[i], pieces[i + 1]
+        lead = _LEAD_PUNCT.match(text) if units else None
+        if lead:
+            units[-1][0] += lead.group(1)
+            text = text[lead.end():]
+        if text.strip():
+            units.append([text.strip(), tag])
+    tail = pieces[-1]
+    lead = _LEAD_PUNCT.match(tail) if units else None
+    if lead:
+        units[-1][0] += lead.group(1)
+        tail = tail[lead.end():]
+    if tail.strip():
+        units.append([tail.strip(), ""])
+    return [(text, tag) for text, tag in units]

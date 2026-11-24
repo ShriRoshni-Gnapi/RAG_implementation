@@ -354,14 +354,14 @@ class DetailedSummary(unittest.TestCase):
         out, _ = run_with_summary("")
         self.assertEqual(out["summary_notes"][0]["reason"], "empty reply from the model")
         out, _ = run_with_summary(f"{GOOD_SUMMARY}")                    # model forgot the evidence numbers
-        self.assertEqual(out["summary_notes"][0]["reason"], "no sentence numbers at the end")
+        self.assertEqual(out["summary_notes"][0]["reason"], "no valid sentence numbers")
         self.assertEqual(out["reference_entries"][0]["summary_raw"], GOOD_SUMMARY)
 
     def test_paragraph_without_valid_evidence_is_dropped(self):
         out, _ = run_with_summary(f"{GOOD_SUMMARY}\n{GOOD_SUMMARY} [99]\n{GOOD_SUMMARY} [0]")
         self.assertNotIn("Detailed Summary", out["references"])
         self.assertEqual([n["reason"] for n in out["summary_notes"]],
-                         ["no sentence numbers at the end", "no valid sentence numbers", "no valid sentence numbers"])
+                         ["no valid sentence numbers"] * 3)
 
     def test_invented_number_or_name_is_dropped(self):
         for bad, reason in (
@@ -404,11 +404,76 @@ class DetailedSummary(unittest.TestCase):
         out = engine.find_references(RIGHT_KNEE_NOTE, summaries=True)
         self.assertEqual(len(out["reference_entries"]), 1)         # same book, chapter, section, pages
         self.assertEqual(out["reference_entries"][0]["summary"],
-                         ["The text lists rest in the acute stage as one point"])   # evidence [5] is in the 2nd passage
+                         ["The text lists rest in the acute stage as one point."])   # evidence [5] is in the 2nd passage
+        self.assertEqual(out["reference_entries"][0]["summary_passage"][4], "Rest helps in the acute stage.")
         prompt = llm.calls[1]["user_prompt"]
         self.assertIn("(4) Check foot posture.", prompt)
         self.assertIn("(5) Rest helps in the acute stage.", prompt)  # numbering continues across passages
         self.assertEqual(len(llm.calls), 2)                        # one summary call per citation
+
+    def test_inline_tags_after_each_sentence_like_the_real_model_writes_them(self):
+        reply = ("Patellofemoral pain is linked to stair use [1]. Weakness of the hip abductor muscles is common "
+                 "in these patients [2].\n\n"
+                 "The patient may report pain after prolonged sitting with the knees bent [3]. [1, 2, 3]")
+        out, _ = run_with_summary(reply)
+        self.assertEqual(out["reference_entries"][0]["summary"], [
+            "Patellofemoral pain is linked to stair use. Weakness of the hip abductor muscles is common in these patients.",
+            "The patient may report pain after prolonged sitting with the knees bent."])
+        self.assertNotIn("[", out["references"])               # no bracket numbers reach the output
+        self.assertEqual(out["summary_notes"], [])             # a closing "[1, 2, 3]" is not an error
+
+    def test_a_failing_sentence_is_dropped_and_the_rest_of_the_paragraph_is_kept(self):
+        reply = ("Patellofemoral pain is linked to stair use [1]. The pain rises by 40 percent on stairs [1]. "
+                 "Weakness of the hip abductor muscles is common in these patients [2].")
+        out, _ = run_with_summary(reply)
+        self.assertEqual(out["reference_entries"][0]["summary"], [
+            "Patellofemoral pain is linked to stair use. Weakness of the hip abductor muscles is common in these patients."])
+        self.assertEqual([n["reason"] for n in out["summary_notes"]], ["number not in the passage: 40"])
+
+    def test_bracket_digits_are_not_counted_as_numbers_in_the_text(self):
+        kept, rejected = parse_summary("Patellofemoral pain is linked to stair use [1]. [1, 2, 3]", [S1, S2, S3, S4])
+        self.assertEqual((kept, rejected), (["Patellofemoral pain is linked to stair use."], []))
+
+    def test_each_sentence_is_checked_against_the_sentences_it_cites(self):
+        # the sentence is about stairs but cites sentence 4 (foot posture): not supported there
+        kept, rejected = parse_summary("Patellofemoral pain is linked to stair use [4].", [S1, S2, S3, S4])
+        self.assertEqual(kept, [])
+        self.assertEqual(rejected[0]["reason"], "not supported by the sentences it cites")
+
+    def test_real_model_reply_for_the_kisner_citation_is_parsed(self):
+        """
+        Replay of a real server reply (book text only). It checks the parsing
+        and the rules, not that the summary is faithful: a kept sentence can
+        still add an inference the book does not state.
+        """
+        passage = [
+            "swelling, limited motion, and pain with dysfunction whenever contracting the quadriceps, such as during "
+            "stair climbing, squatting, and resisted knee extension.",
+            "Etiology of Symptoms The cause of anterior knee pain may be direct trauma, overuse, faulty patellar "
+            "tracking from malalignment due to anatomical variations or soft tissue length and strength "
+            "imbalances, degeneration, or a combination of these factors.",
+            "An attempt should be made to determine the causative factors based on the patient’s history and a "
+            "comprehensive and sequential examination."]
+        reply = ("Anterior knee pain is characterized by symptoms such as swelling, restricted movement, pain, and "
+                 "functional impairment that occur specifically when the quadriceps muscle contracts, particularly "
+                 "during activities like climbing stairs, squatting, or performing resisted knee extension [1]. These "
+                 "symptoms indicate that the pain is linked to the function of the quadriceps and the mechanics of the "
+                 "knee joint during dynamic movements [1].\n\n"
+                 "The underlying causes of anterior knee pain can include direct injury, repetitive overuse, improper "
+                 "tracking of the patella due to structural abnormalities or imbalances in muscle strength and soft "
+                 "tissue length, degenerative changes, or a combination of these factors [2]. Identifying the specific "
+                 "cause requires a thorough evaluation that considers the patient’s medical history and involves a "
+                 "systematic, step-by-step physical examination [3].\n\n"
+                 "The clinical approach emphasizes the importance of determining the root cause of symptoms by "
+                 "integrating information from the patient’s history with findings from a structured examination [3]. "
+                 "This process ensures that treatment can be tailored to the individual’s specific contributing "
+                 "factors, whether they stem from trauma, overuse, alignment issues, or degeneration [2, 3]. [1, 2, 3]")
+        kept, rejected = parse_summary(reply, passage)
+        self.assertEqual(len(kept), 3)
+        self.assertTrue(kept[0].startswith("Anterior knee pain is characterized") and kept[0].endswith("knee extension."))
+        self.assertTrue(all("[" not in p for p in kept))
+        self.assertEqual([r["reason"] for r in rejected], ["not supported by the sentences it cites"])
+        self.assertTrue(rejected[0]["paragraph"].startswith("These symptoms indicate"))
 
     def test_parse_summary_evidence_formats(self):
         sents = [S1, S2, S3, S4]
