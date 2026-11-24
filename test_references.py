@@ -356,6 +356,26 @@ class SupportingBehaviour(unittest.TestCase):
         self.assertTrue(got[1].endswith("here.27,47,135"))
         self.assertTrue(got[3].startswith("Dr. Jones"))
 
+    def test_reference_numbers_are_removed_but_real_numbers_are_kept(self):
+        text = ("The cause may be trauma or overuse.27,47,100,116,135,189,201,215, 242,256 Pain and joint "
+                "effusion inhibit the quadriceps,231 so reduce irritating forces. Load rises from 0.5 times "
+                "to 3 times body weight (Fig. 4-44), and the angle was 30.5 degrees at Level 3.2 "
+                "(Figure 12-5).31 The deep bursa is a source of pain.107")
+        got = [s.text for s in sentences_for(text)]
+        self.assertEqual(got, [
+            "The cause may be trauma or overuse.",
+            "Pain and joint effusion inhibit the quadriceps, so reduce irritating forces.",
+            "Load rises from 0.5 times to 3 times body weight (Fig. 4-44), and the angle was 30.5 degrees "
+            "at Level 3.2 (Figure 12-5).",
+            "The deep bursa is a source of pain."])
+
+    def test_printed_sentences_have_no_reference_numbers(self):
+        text = "An attempt should be made to find the cause.27,47,135 Splinting may unload the joint.107"
+        engine, _ = make_engine(lambda p: [hit("a1", text)], "Source 1: 1, 2")
+        ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
+        self.assertEqual(ref.split("\n")[1:], ['"An attempt should be made to find the cause."',
+                                               '"Splinting may unload the joint."'])
+
     def test_chapter_and_section_from_stored_outline(self):
         kisner = hit("k", "x", chapter="Therapeutic Exercise: Foundations and Techniques, Fifth Edition",
                      section_path="Therapeutic Exercise: Foundations and Techniques, Fifth Edition > Part IV: "

@@ -9,7 +9,8 @@ It never calls a model and never rewrites a word. Page furniture is only used
 to find where a page break fell; a sentence touching a page break or a chunk
 edge is flagged as cut, so the caller can leave it out instead of printing
 half a sentence. Every sentence returned is a slice of the stored text
-(whitespace collapsed to single spaces).
+(whitespace collapsed to single spaces), with one deliberate exception: the
+book's own reference numbers ("factors.27,47,135") are removed.
 """
 
 import re
@@ -69,12 +70,15 @@ _ABBREVIATIONS = frozenset({
     "st", "jr", "sr", "inc", "ltd", "co", "dept", "e.g", "i.e",
 })
 
-# Sentence end: . ! ? (closing quote/bracket) (reference numbers like .27,47)
-# followed by a space and something that can start a sentence.
-_BOUNDARY = re.compile(
-    r"""([.!?]["'”’)\]]*(?:\d{1,3}(?:\s?[,–\-]\s?\d{1,3})*)?)\s+(?=[A-Z(\[\d])"""
+# Sentence end: . ! ? (closing quote/bracket), optionally followed by the book's
+# reference numbers (".27,47"). Reference numbers only count after punctuation
+# that does not follow a digit, so the decimal in "Level 3.2 (Figure 5)" is not
+# read as a sentence end, while "6/10. Reports" still is.
+_SENTENCE_END = (
+    r"""(?:(?<!\d)[.!?]["'”’)\]]*\d{1,3}(?:\s?[,–\-]\s?\d{1,3})*|[.!?]["'”’)\]]*)"""
 )
-_TERMINAL = re.compile(r"""[.!?]["'”’)\]]*(?:\d{1,3}(?:\s?[,–\-]\s?\d{1,3})*)?$""")
+_BOUNDARY = re.compile(rf"({_SENTENCE_END})\s+(?=[A-Z(\[\d])")
+_TERMINAL = re.compile(rf"{_SENTENCE_END}$")
 _BULLET = re.compile(r"\s*•\s*")
 
 
@@ -107,6 +111,20 @@ def split_text(text: str) -> List[str]:
     return out
 
 
+# The book's reference numbers are raised numbers in print, so extraction leaves
+# them glued to the punctuation: "factors.27,47,135", "quadriceps,231 so",
+# "(Figure 12-5).31". Only digits that follow a letter or closing bracket plus
+# punctuation, with no space, match; "0.5", "30.5", "3.2" and "(Fig. 4-44)" do not.
+_REFERENCE_NUMBERS = re.compile(
+    r"""(?<=[A-Za-z)\]"'”’])([.,;:])\d{1,3}(?:\s?[,–\-]\s?\d{1,3})*(?=\s|$)"""
+)
+
+
+def strip_reference_numbers(text: str) -> str:
+    """Remove the book's own reference numbers, keeping the punctuation they followed."""
+    return _REFERENCE_NUMBERS.sub(r"\1", text)
+
+
 def sentences_for(text: str) -> List[Sentence]:
     """
     A stored passage as sentences, each flagged when it is cut off.
@@ -134,7 +152,7 @@ def sentences_for(text: str) -> List[Sentence]:
     last = len(frags) - 1
     return [
         Sentence(
-            text=f,
+            text=strip_reference_numbers(f),
             cut_start=f[:1].islower() and (i == 0 or i in after_break),
             cut_end=(i == last or i in before_break) and not _TERMINAL.search(f),
         )
