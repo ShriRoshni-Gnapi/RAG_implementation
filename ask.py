@@ -153,8 +153,19 @@ def interactive_mode(book_key: str = None, top_k: int = 5):
             print(f"\n[Error] {type(e).__name__}: {e}\n")
 
 
+def run_reference_mode(path: str, top_k: int, json_mode: bool) -> int:
+    """Read a SOAP note and print only its matching textbook references."""
+    note = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
+    if not note.strip():
+        print("Error: the SOAP note is empty.")
+        return 2
+    res = PTQueryEngine(top_k=top_k).find_references(note, top_k=top_k)
+    print(json.dumps(res, indent=2, ensure_ascii=False) if json_mode else res["references"])
+    return 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Physiotherapy RAG + NVIDIA Nemotron Query Interface")
+    parser =argparse.ArgumentParser(description="Physiotherapy RAG + NVIDIA Nemotron Query Interface")
     parser.add_argument("question", nargs="?", help="Clinical question to ask")
     parser.add_argument("--book", "-b", help="Specific book key to search (e.g. paz_acute_care)")
     parser.add_argument("--all-books", "-a", action="store_true", default=True, help="Search across all ingested books (default)")
@@ -162,8 +173,13 @@ def main():
     parser.add_argument("--interactive", "-i", action="store_true", help="Start interactive Q&A assistant loop")
     parser.add_argument("--check-api", "-c", action="store_true", help="Test LLM and Qdrant connectivity")
     parser.add_argument("--json", "-j", action="store_true", help="Output response in JSON format")
+    parser.add_argument("--soap-file", "-s", metavar="PATH",
+                        help="SOAP note text file ('-' reads stdin); prints only the matching textbook references")
 
     args = parser.parse_args()
+
+    if args.soap_file:
+        return run_reference_mode(args.soap_file, args.top_k, args.json)
 
     if args.check_api:
         check_api_connectivity()

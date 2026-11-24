@@ -18,6 +18,7 @@ Flow:
 """
 
 import os
+import re
 import time
 from typing import Dict, List, Optional, Any, Callable
 
@@ -29,8 +30,17 @@ from config import (
     get_qdrant_config,
 )
 from llm_client import LLMClient, get_llm_client
-from prompts import SYSTEM_PROMPT, assemble_context, build_user_prompt
+from prompts import (
+    SYSTEM_PROMPT,
+    REFERENCE_SYSTEM_PROMPT,
+    NO_REFERENCE_TEXT,
+    assemble_context,
+    build_user_prompt,
+    build_reference_user_prompt,
+)
 from citations import (
+    extract_source_labels,
+    format_reference_list,
     validate_citations,
     render_citation_entry,
     format_citations_block,
@@ -47,6 +57,39 @@ def get_embedding_model():
         from sentence_transformers import SentenceTransformer
         _CACHED_EMBED_MODEL = SentenceTransformer(EMBEDDING_MODEL)
     return _CACHED_EMBED_MODEL
+
+
+# The embedding model reads only ~256 tokens; 500 characters of clinical prose
+# stays under that (config.py measured up to 0.42 tokens/char).
+NOTE_SEGMENT_CHARS = 500
+
+
+def split_note(text: str, max_chars: int = NOTE_SEGMENT_CHARS) -> List[str]:
+    """
+    Cut a long note into pieces the embedding model reads in full.
+
+    Searching with the whole note would silently use only its first ~256
+    tokens, so the rest of the note would never influence retrieval.
+    """
+    pieces, cur = [], ""
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        sentence = sentence.strip()
+        while len(sentence) > max_chars:          # one very long sentence
+            if cur:
+                pieces.append(cur)
+                cur = ""
+            pieces.append(sentence[:max_chars])
+            sentence = sentence[max_chars:].strip()
+        if not sentence:
+            continue
+        if cur and len(cur) + len(sentence) + 1 > max_chars:
+            pieces.append(cur)
+            cur = sentence
+        else:
+            cur = f"{cur} {sentence}".strip()
+    if cur:
+        pieces.append(cur)
+    return pieces
 
 
 class PTQueryEngine:
@@ -185,6 +228,67 @@ class PTQueryEngine:
             "generation_ms": round(generation_ms, 1),
             "total_ms": round(total_ms, 1),
             "formatted_output": formatted_output,
+        }
+
+
+    def retrieve_for_note(
+        self,
+        note: str,
+        top_k: Optional[int] = None,
+        max_sources: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search every segment of the note, merge by chunk (best score wins) and
+        keep the strongest passages. Unlike query(), a passage below min_score
+        is never kept as a fallback: no strong match means no reference.
+        """
+        best: Dict[str, Dict[str, Any]] = {}
+        for piece in split_note(note):
+            for hit in self.retrieve_chunks(piece, all_books=True, top_k=top_k):
+                key = hit.get("chunk_id") or hit.get("content") or ""
+                if key not in best or hit["score"] > best[key]["score"]:
+                    best[key] = hit
+        ranked = sorted(best.values(), key=lambda h: h["score"], reverse=True)
+        return [h for h in ranked if h["score"] >= self.min_score][:max_sources]
+
+    def find_references(
+        self,
+        soap_note: str,
+        top_k: Optional[int] = None,
+        max_sources: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        SOAP note -> combined list of relevant textbook references.
+
+        The model only chooses which retrieved passages are relevant. The
+        printed list is built from stored metadata and passage text, so a
+        book title, author, chapter or page can never be invented.
+        """
+        t0 = time.time()
+        hits = self.retrieve_for_note(soap_note, top_k=top_k, max_sources=max_sources)
+        retrieval_ms = (time.time() - t0) * 1000
+
+        raw_answer, model = "", self.client.model
+        if hits:
+            # max_chars sized so no retrieved passage is dropped from the prompt
+            context_text = assemble_context(hits, max_chars=len(hits) * 3000)
+            gen = self.client.generate(
+                system_prompt=REFERENCE_SYSTEM_PROMPT,
+                user_prompt=build_reference_user_prompt(soap_note, context_text),
+                temperature=0.0,
+            )
+            raw_answer = gen.get("text", "")
+            model = gen.get("model", model)
+
+        indices = extract_source_labels(raw_answer, len(hits))
+        return {
+            "references": format_reference_list(hits, indices) if hits else NO_REFERENCE_TEXT,
+            "source_indices": indices,
+            "retrieved_count": len(hits),
+            "raw_answer": raw_answer,
+            "model": model,
+            "retrieval_ms": round(retrieval_ms, 1),
+            "total_ms": round((time.time() - t0) * 1000, 1),
         }
 
 

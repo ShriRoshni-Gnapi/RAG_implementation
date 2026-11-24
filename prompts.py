@@ -37,6 +37,10 @@ def format_source_header(hit: Dict[str, Any], index: int) -> str:
     sec = hit.get("section")
     subsec = hit.get("subsection")
 
+    author = hit.get("author")
+    if author:
+        parts.append(f"Author: {author}")
+
     hierarchy = []
     if ch and ch != "None":
         hierarchy.append(f"Ch: {ch}")
@@ -116,5 +120,48 @@ Provide an in-depth, authoritative, comprehensive clinical response to the quest
 Synthesize the reference textbook excerpts above with your extensive clinical knowledge, pathophysiology, and practical rehabilitation principles into a single, cohesive, well-structured clinical consultation.
 Do NOT include any bracketed numbers or citation markers (such as [1], [2]) anywhere in your text.{intent_instruction}"""
     return prompt
+
+
+# --------------------------------------------------------------------------
+# SOAP note -> textbook references (reference-retrieval mode)
+# --------------------------------------------------------------------------
+
+REFERENCE_SYSTEM_PROMPT = """You are a Physiotherapy Textbook Reference Retrieval Assistant.
+Your task is to analyse the complete SOAP note and identify relevant references from the retrieved physiotherapy textbook passages.
+Instructions:
+
+1. Read the complete Subjective, Objective and Assessment sections.
+2. Identify important clinical terms, symptoms, examination findings and assessment concepts.
+3. Match these concepts against the retrieved textbook passages.
+4. Return only references directly relevant to the complete SOAP note.
+5. Include book title, author, chapter, section, page number and relevant supporting passage.
+6. Do not mention which SOAP section a reference belongs to.
+7. Do not generate diagnoses, treatment plans, clinical advice or additional explanations.
+8. Do not use your own medical knowledge to create references.
+9. Never invent book titles, authors, chapters or page numbers.
+10. If no relevant reference is found, explicitly state that no matching reference was found.
+
+Output only a combined list of relevant textbook references."""
+
+NO_REFERENCE_TEXT = "No matching reference was found."
+
+
+def build_reference_user_prompt(soap_note: str, context_text: str) -> str:
+    """
+    User message for reference mode: the retrieved passages plus the SOAP note.
+
+    The "Source N" label is requested so the caller can map each reference
+    back to a retrieved passage and print its book details from stored
+    metadata, instead of trusting the model to retype titles and page numbers.
+    """
+    return f"""RETRIEVED TEXTBOOK PASSAGES:
+═════════════════════════════════════════════════════════════
+{context_text}
+═════════════════════════════════════════════════════════════
+
+SOAP NOTE:
+{soap_note}
+
+Return the combined list of relevant references. Begin each reference with its source label exactly as written above (for example "Source 3"), then give the book title, author, chapter, section, page number and the supporting passage taken from that source. Write "not recorded" for any detail the source does not show. If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
 
 

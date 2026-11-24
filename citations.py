@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Set, Tuple, Optional
 
 from config import BOOKS_DIR, BOOKS
+from prompts import NO_REFERENCE_TEXT
 
 DISCLAIMER_TEXT = (
     "Clinical decision-making requires individual patient assessment."
@@ -147,6 +148,36 @@ def render_citation_entry(hit: Dict[str, Any], index: Optional[int] = None) -> D
         "score": hit.get("score"),
         "preview": (hit.get("content") or hit.get("text") or "")[:200],
     }
+
+
+def extract_source_labels(text: str, num_hits: int) -> List[int]:
+    """
+    Source numbers the model named in reference mode ("Source 3: ...").
+
+    Out-of-range numbers are dropped, so a label the model made up can never
+    reach the printed list.
+    """
+    found = {int(n) for n in re.findall(r"Source\s*(\d+)", text or "", re.I)}
+    return sorted(i for i in found if 1 <= i <= num_hits)
+
+
+def format_reference_list(hits: List[Dict[str, Any]], indices: List[int]) -> str:
+    """
+    Combined reference list for the chosen sources, written from stored
+    metadata (book, author, chapter, section, pages) and the stored passage
+    text. Nothing here comes from the model's wording.
+    """
+    if not indices:
+        return NO_REFERENCE_TEXT
+
+    blocks = []
+    for n, idx in enumerate(indices, 1):
+        hit = hits[idx - 1]
+        entry = render_citation_entry(hit, idx)
+        passage = " ".join((hit.get("content") or hit.get("text") or "").split())
+        head = entry["formatted_text"].replace("• ", "", 1)
+        blocks.append(f"{n}. {head}\n    Passage: {passage}")
+    return "\n\n".join(blocks)
 
 
 def format_citations_block(
