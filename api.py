@@ -4,6 +4,7 @@ FastAPI Server Gateway for PT-RAG (Production Deployment).
 Provides:
   - OpenAI-compatible endpoint: POST /v1/chat/completions (port 8080)
   - REST endpoint: POST /ask
+  - Textbook references for a SOAP note: POST /references
   - Health check: GET /health
 
 Usage:
@@ -14,11 +15,14 @@ import time
 import uuid
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from query_engine import PTQueryEngine
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMError
 from config import LLM_MODEL, QDRANT_URL, LLM_API_URL
 import qdrant_store
 
@@ -69,6 +73,94 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_k: Optional[int] = 5
+
+
+# --------------------------------------------------------------------------
+# POST /references: textbook references for the S, O and A of a saved SOAP note
+# --------------------------------------------------------------------------
+
+MAX_SECTION_CHARS = 8000          # per section; a longer note is refused, not cut
+
+
+class ReferencesRequest(BaseModel):
+    subjective: str = Field("", max_length=MAX_SECTION_CHARS)
+    objective: str = Field("", max_length=MAX_SECTION_CHARS)
+    assessment: str = Field("", max_length=MAX_SECTION_CHARS)
+    top_k: int = Field(5, ge=1, le=20)
+
+
+class ReferenceItem(BaseModel):
+    book: str
+    author: Optional[str] = None
+    chapter: Optional[str] = None
+    section: Optional[str] = None
+    pages: Optional[str] = None
+    summary: List[str]            # checked, model-written paragraphs (the only model text)
+    sentences: List[str]          # the book's own sentences the summary is about
+
+
+class ReferencesResponse(BaseModel):
+    status: str                   # "ready", or "empty" when nothing relevant had a supported summary
+    generator: str                # which prompts and filters produced this set
+    references: List[ReferenceItem]
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, exc: RequestValidationError):
+    """
+    The default 422 body echoes the submitted values back. On /references those
+    are a patient's note, so that route answers a generic message; every other
+    route keeps FastAPI's default answer.
+    """
+    if request.url.path == "/references":
+        return JSONResponse(status_code=422, content={"detail": "The request is invalid."})
+    return await request_validation_exception_handler(request, exc)
+
+
+def references_response(result: Dict[str, Any]) -> ReferencesResponse:
+    """
+    The caller's view of `find_references`: only citations that have a
+    supported summary, with the fields below. Never the model's raw reply, the
+    candidate list, or the notes and passage used to check the summaries.
+    """
+    if any(n["reason"].startswith("summary call failed") for n in result["summary_notes"]):
+        raise HTTPException(status_code=503, detail="The reference service is unavailable (summary).")
+    items = [
+        ReferenceItem(
+            book=e["book"], author=e["author"], chapter=e["chapter"], section=e["section"],
+            pages=e["pages"], summary=e["summary"], sentences=e["sentences"],
+        )
+        for e in result["reference_entries"] if e.get("summary")
+    ]
+    return ReferencesResponse(
+        status="ready" if items else "empty",
+        generator=result["generator"],
+        references=items,
+    )
+
+
+@app.post("/references", response_model=ReferencesResponse)
+def references(req: ReferencesRequest):
+    """
+    Textbook references, with a checked summary of each cited passage, for the
+    Subjective, Objective and Assessment text of a note. Nothing else about the
+    patient is accepted. The note is never logged or echoed in an error.
+    """
+    sections = [
+        (label, text) for label, text in
+        (("S", req.subjective), ("O", req.objective), ("A", req.assessment)) if text.strip()
+    ]
+    if not sections:
+        raise HTTPException(status_code=400, detail="No Subjective, Objective or Assessment text was given.")
+    try:
+        result = engine.find_references(
+            "", top_k=req.top_k, summaries=True, summary_only=True, sections=sections)
+    except (LLMError, qdrant_store.VectorStoreError) as e:
+        raise HTTPException(status_code=503, detail=f"The reference service is unavailable ({type(e).__name__}).")
+    except Exception as e:
+        print(f"/references failed: {type(e).__name__}", flush=True)      # the type only, never the message
+        raise HTTPException(status_code=500, detail="The reference lookup failed.")
+    return references_response(result)
 
 
 @app.on_event("startup")

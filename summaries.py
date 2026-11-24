@@ -33,6 +33,14 @@ _WORD = re.compile(r"[A-Za-z]+")
 _ACRONYM_OR_NAME = re.compile(r"\b(?:[A-Z]{2,}[a-z]?|[A-Z][a-z]{2,})\b")
 _SENTENCE_START = re.compile(r"(?:^|(?<=[.!?])\s+)\S+")
 
+# "This suggests that ...", "These symptoms indicate ...", "This process ensures ...":
+# the model drawing its own conclusion from the passage, not stating what the
+# passage says. Only sentences opening "This"/"These" are caught; others that
+# reach a conclusion ("The lack of correlation suggests ...") are not.
+_CONCLUSION = re.compile(
+    r"^(?:This|These)\b[^.]{0,60}?\b"
+    r"(?:suggests?|means?|highlights?|ensures?|indicates?|implies|imply|emphasi[sz]es?|demonstrates?)\b")
+
 MIN_UNIT_CHARS = 25
 MIN_SHARED_STEMS = 2
 _STEM = 5
@@ -79,6 +87,8 @@ def _reject_reason(text: str, ids: List[int], sentences: List[str], passage: str
         return "no valid sentence numbers"
     if len(text) < MIN_UNIT_CHARS:
         return "too short"
+    if _CONCLUSION.match(text):
+        return "a conclusion, not a statement from the passage"
     norm = _norm(text)
     if any(len(s) > 40 and _norm(s) in norm for s in sentences):
         return "copies an original sentence"

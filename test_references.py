@@ -470,7 +470,7 @@ class DetailedSummary(unittest.TestCase):
         """
         Replay of a real server reply (book text only). It checks the parsing
         and the rules, not that the summary is faithful: a kept sentence can
-        still add an inference the book does not state.
+        still add something the book does not state.
         """
         passage = [
             "swelling, limited motion, and pain with dysfunction whenever contracting the quadriceps, such as during "
@@ -498,8 +498,54 @@ class DetailedSummary(unittest.TestCase):
         self.assertEqual(len(kept), 3)
         self.assertTrue(kept[0].startswith("Anterior knee pain is characterized") and kept[0].endswith("knee extension."))
         self.assertTrue(all("[" not in p for p in kept))
-        self.assertEqual([r["reason"] for r in rejected], ["not supported by the sentences it cites"])
+        # the two sentences that draw their own conclusion are dropped, the other four are kept
+        self.assertEqual([r["reason"] for r in rejected], ["a conclusion, not a statement from the passage"] * 2)
         self.assertTrue(rejected[0]["paragraph"].startswith("These symptoms indicate"))
+        self.assertTrue(rejected[1]["paragraph"].startswith("This process ensures"))
+        self.assertNotIn("ensures", " ".join(kept))
+
+    def test_conclusion_sentences_are_dropped(self):
+        for sentence in ("This suggests that stair use is the main cause of patellofemoral pain",
+                         "This means that pain on stairs is common in these patients",
+                         "This highlights the importance of hip abductor strength in these patients",
+                         "This ensures that every patient with stair pain is treated the same way",
+                         "These findings indicate that patellofemoral pain is common in these patients"):
+            kept, rejected = parse_summary(f"{sentence} [1, 2].", [S1, S2, S3, S4])
+            self.assertEqual(kept, [], sentence)
+            self.assertEqual(rejected[0]["reason"], "a conclusion, not a statement from the passage")
+        # a statement that merely contains such a verb, or starts differently, is not caught here
+        kept, _ = parse_summary("Patellofemoral pain is described as worse on stairs, which means stairs "
+                                "provoke it [1].", [S1, S2, S3, S4])
+        self.assertEqual(len(kept), 1)
+
+    def test_summary_prompt_forbids_definitions_and_conclusions(self):
+        for phrase in ("Do not define or explain a term unless the passage itself defines or explains it",
+                       "Do not draw conclusions from it", '"This suggests", "This means", "This highlights"'):
+            self.assertIn(phrase, SUMMARY_SYSTEM_PROMPT)
+
+    def test_summary_is_focused_on_the_sentences_chosen_for_the_note(self):
+        engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 2, 3",
+                                  summary_reply=f"{GOOD_SUMMARY} [1, 2]")
+        engine.find_references(RIGHT_KNEE_NOTE, summaries=True)
+        prompt = llm.calls[1]["user_prompt"]
+        self.assertIn("Sentences 2, 3 were chosen as the ones that matter for this note", prompt)
+        self.assertIn("(1) " + S1, prompt)                                   # the whole passage is still shown
+        self.assertIn("Leave out parts of the passage about other conditions", prompt)
+
+    def test_structured_sections_are_used_without_parsing_markers(self):
+        # a Subjective line that starts "P:" must not be read as the Plan and dropped
+        sections = [("S", "P: patient says the knee hurts on stairs.\nSwelling after long walks."),
+                    ("O", "Flexion 110 degrees."), ("A", "Patellofemoral pain."), ("P", "Strengthening.")]
+        engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1")
+        engine.find_references("", sections=sections)
+        self.assertTrue(any("patient says the knee hurts on stairs" in q for q in engine.queries))
+        self.assertFalse(any("Strengthening" in q for q in engine.queries))             # the real Plan is still left out
+        self.assertNotIn("Strengthening", llm.calls[0]["user_prompt"])
+        self.assertIn("P: patient says the knee hurts on stairs.", llm.calls[0]["user_prompt"])
+
+    def test_generator_version_is_reported(self):
+        engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1")
+        self.assertEqual(engine.find_references(RIGHT_KNEE_NOTE)["generator"], qe.GENERATOR_VERSION)
 
     def test_parse_summary_evidence_formats(self):
         sents = [S1, S2, S3, S4]
@@ -529,16 +575,23 @@ QUESTIONS = ["Is the pain worse in the morning when the patient gets out of bed 
              "On a scale of a to 10, with the worst pain they have ever experienced being a 10, what does their "
              "daily pain rate?"]
 KEPT = ["Pain and joint effusion inhibit the quadriceps, so it is imperative to reduce irritating forces.",
-        "These include treatment modalities that have im proved the pain (e.g., physical therapy, cortisone in "
-        "jections, medications, and splinting or bracing) as well as what makes the symptoms worse (e.g., walk "
-        "ing, running, athletic activity, stair climbing, or job activities).",
         "PFJRFs (Fig. 4-44) increase with flexion of the knee from 0.5 times body weight during level walking to "
         "3 to 4 times body weight during stairclimbing to 7 to 8 times body weight with squatting.",
-        "Etiology of Symptoms The cause of anterior knee pain may be direct trauma, overuse, faulty patellar "
-        "tracking from malalignment due to anatomical variations or soft tissue length and strength imbalances, "
-        "degeneration, or a combination of these factors.",
-        "However, critical review of available studies found no evidence that Q-angle measures correlated with "
-        "the presence or severity of anterior knee pain."]
+        "The McConnell Test is positive when pain is felt during the step down and the patient cannot control it.",
+        "Anterior Cruciate Ligament injuries are common in sports that need cutting and landing."]
+# Glued Title Case headings, and sentences that lean on the sentence before them.
+TITLE_HEADINGS = [
+    "Etiology of Symptoms The cause of anterior knee pain may be direct trauma, overuse, faulty patellar tracking "
+    "from malalignment due to anatomical variations or soft tissue length and strength imbalances, degeneration, "
+    "or a combination of these factors.",
+    "Common Impairments and Functional Limitations/Disabilities Impairments that may be associated with "
+    "patellofemoral dysfunction include the following."]
+DEPENDENT = [
+    "However, critical review of available studies found no evidence that Q-angle measures correlated with the "
+    "presence or severity of anterior knee pain.",
+    "These include treatment modalities that have improved the pain as well as what makes the symptoms worse.",
+    "This signals lateral patellar instability.",
+    "It is imperative to reduce irritating forces when the joint is swollen and painful."]
 
 
 def usable(text):
@@ -572,8 +625,17 @@ class NoiseFilters(unittest.TestCase):
         for s in KEPT:
             self.assertTrue(usable(s), s)
 
+    def test_title_case_headings_glued_to_a_sentence_are_not_usable(self):
+        for s in TITLE_HEADINGS:
+            self.assertFalse(usable(s), s)
+
+    def test_sentences_that_lean_on_the_previous_one_are_not_usable(self):
+        for s in DEPENDENT:
+            self.assertFalse(usable(s), s)
+        self.assertTrue(usable("Items that follow it are fine, and so is this sentence about the Italian study."))
+
     def test_real_run_filters_out_exactly_the_noise(self):
-        text = " ".join([RUN_ON, GLUED_HEADING, *QUESTIONS, *KEPT])
+        text = " ".join([RUN_ON, GLUED_HEADING, *QUESTIONS, *TITLE_HEADINGS, *DEPENDENT, *KEPT])
         offered = [s.text for s in sentences_for(text) if s.usable]
         self.assertEqual(offered, KEPT)
 

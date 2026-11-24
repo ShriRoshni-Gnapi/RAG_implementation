@@ -32,11 +32,13 @@ class Sentence(NamedTuple):
     def usable(self) -> bool:
         """
         Safe to offer and print: complete, free of glued headings, not a
-        question (history-taking prompts in the books) and not a run-on that
-        merges list items or headings into one 'sentence'.
+        question (history-taking prompts in the books), not a run-on that
+        merges list items or headings into one 'sentence', and not a sentence
+        that depends on the one before it.
         """
         return (self.complete and not self.heading
-                and not _QUESTION.search(self.text) and not _is_run_on(self.text))
+                and not _QUESTION.search(self.text) and not _is_run_on(self.text)
+                and not _DEPENDENT_START.match(self.text))
 
 
 def hit_text(hit: Dict[str, Any]) -> str:
@@ -78,11 +80,32 @@ _CAPS_RUN_ANY = re.compile(rf"(?:{_CAPS_TOKEN}(?:\s+|$)){{2,}}")
 _CHAPTER_START = re.compile(r"^(?:CHAPTER|PART|SECTION|APPENDIX)\s+\w+\b")
 
 
+# A Title Case heading glued to the front of a sentence, with no punctuation
+# between: "Etiology of Symptoms The cause of ..." (a heading, then a sentence
+# starting "The") and "Common Impairments and Functional Limitations/Disabilities
+# Impairments that may ..." (four or more Title Case words, then lower case).
+# Three words ("The McConnell Test is ...") are left alone: test and
+# condition names are often written that way inside real sentences.
+_TITLE_WORD = r"[A-Z][A-Za-z]+(?:/[A-Z][A-Za-z]+)?"
+_CONNECTOR = r"(?:of|and|in|for|to|on|with)"
+_SENTENCE_STARTERS = r"(?:The|A|An|In|It|This|These|When|If|During|There)"
+_HEADING_THEN_SENTENCE = re.compile(
+    rf"^{_TITLE_WORD}\s+{_CONNECTOR}\s+{_TITLE_WORD}\s+{_SENTENCE_STARTERS}\s+[a-z]")
+_TITLE_RUN = re.compile(rf"^(?:{_TITLE_WORD}(?:\s+{_CONNECTOR})?\s+){{4,}}[a-z]")
+
+
 def _has_heading(text: str) -> bool:
-    if _CHAPTER_START.match(text):
+    if _CHAPTER_START.match(text) or _HEADING_THEN_SENTENCE.match(text) or _TITLE_RUN.match(text):
         return True
     return any(sum(c.isalpha() for c in m.group()) >= _MIN_HEAD_LETTERS
                for m in _CAPS_RUN_ANY.finditer(text))
+
+
+# A sentence that begins "However", "This", "These" or "It" leans on the sentence
+# before it, so it is not offered on its own ("This signals lateral patellar
+# instability."). A real "It is ..." sentence is lost too; that is the price of
+# never printing a sentence whose subject the reader cannot see.
+_DEPENDENT_START = re.compile(r"^(?:However|This|These|It)\b")
 
 
 # --------------------------------------------------------------------------

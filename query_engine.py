@@ -75,6 +75,10 @@ NOTE_SEGMENT_CHARS = 500
 # server's model emits before them.
 SUMMARY_MAX_TOKENS = 1500
 
+# Stored with every generated set so a caller can tell which prompts and filters
+# produced it. Change it whenever the prompts, sentence filters or summary checks change.
+GENERATOR_VERSION = "pt-rag-references-1"
+
 # "S:", "O:", "A:", "P:" or "Subjective:" ... at the start of a line.
 _SECTION_MARK = re.compile(
     r"(?m)^[ \t]*(?:(?i:(subjective|objective|assessment|plan))[ \t]*[:\-–]|([SOAP])[ \t]*:)[ \t]*"
@@ -363,10 +367,12 @@ class PTQueryEngine:
         """
         texts = [s.text for idx in entry["sources"] for s in passages[idx - 1]]
         numbered = "\n".join(f"({k}) {t}" for k, t in enumerate(texts, 1))
+        chosen = set(entry["sentences"])
+        focus = [k for k, t in enumerate(texts, 1) if t in chosen]     # the sentences quoted for this note
         try:
             reply = self.client.generate(
                 system_prompt=SUMMARY_SYSTEM_PROMPT,
-                user_prompt=build_summary_user_prompt(numbered),
+                user_prompt=build_summary_user_prompt(numbered, focus),
                 temperature=0.0,
                 max_tokens=SUMMARY_MAX_TOKENS,
             ).get("text", "")
@@ -382,9 +388,14 @@ class PTQueryEngine:
         max_sources: int = 12,
         summaries: bool = False,
         summary_only: bool = False,
+        sections: Optional[List[tuple]] = None,
     ) -> Dict[str, Any]:
         """
         SOAP note -> combined list of relevant textbook references.
+
+        `sections` is an already-split note, [("S", text), ("O", text), ("A", text)].
+        When given, the note is not parsed for "S:" / "O:" markers, so text that
+        happens to start a line with one is never treated as a section break.
 
         Extractive: the model only picks which numbered sentences of which
         retrieved passages are relevant. The book details and the quoted
@@ -400,7 +411,9 @@ class PTQueryEngine:
         summaries = summaries or summary_only
         t0 = time.time()
         # Plan text is not used: the task reads S, O and A and gives no treatment.
-        sections = [(label, body) for label, body in parse_soap_sections(soap_note) if label != "P"]
+        if sections is None:
+            sections = parse_soap_sections(soap_note)
+        sections = [(label, body) for label, body in sections if label != "P" and body.strip()]
         hits = self.retrieve_for_note(sections, top_k=top_k, max_sources=max_sources)
         retrieval_ms = (time.time() - t0) * 1000
 
@@ -452,6 +465,7 @@ class PTQueryEngine:
                 for i, h in enumerate(hits, 1)
             ],
             "retrieved_count": len(hits),
+            "generator": GENERATOR_VERSION,
             "raw_answer": raw_answer,
             "model": model,
             "retrieval_ms": round(retrieval_ms, 1),

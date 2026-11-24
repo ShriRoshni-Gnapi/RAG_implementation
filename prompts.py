@@ -184,10 +184,12 @@ Write a detailed summary of the retrieved passage you are given, using only that
 7. Do not use general medical knowledge, other books, assumptions or anything the passage does not state.
 8. Do not copy the original sentences; explain them in your own words.
 9. Write a well-structured explanation of two to four short paragraphs, not a one-line summary.
-10. If the passage does not give enough information to explain a point, leave that point out. Never guess."""
+10. If the passage does not give enough information to explain a point, leave that point out. Never guess.
+11. Do not define or explain a term unless the passage itself defines or explains it. Do not add what a condition, test or structure "is".
+12. State what the passage says. Do not draw conclusions from it: no sentences that begin "This suggests", "This means", "This highlights", "This ensures", "These indicate" or similar."""
 
 
-def build_summary_user_prompt(numbered_passage: str) -> str:
+def build_summary_user_prompt(numbered_passage: str, focus: Optional[List[int]] = None) -> str:
     """
     User message for the detailed summary of one citation's passage(s).
 
@@ -195,12 +197,24 @@ def build_summary_user_prompt(numbered_passage: str) -> str:
     sentences it is based on. The caller checks those numbers and the
     paragraph against the passage and drops any paragraph it cannot support;
     the numbers themselves are never printed.
+
+    `focus` lists the sentences that were chosen as relevant to the note. The
+    summary is written about their ideas and the text that directly explains
+    them, not about every other topic in the retrieved chunk.
     """
+    focus_text = ""
+    if focus:
+        numbers = ", ".join(str(k) for k in focus)
+        focus_text = (
+            f"\nSentences {numbers} were chosen as the ones that matter for this note. Write the summary about "
+            "the ideas in those sentences and the parts of the passage that directly explain them. Leave out "
+            "parts of the passage about other conditions, procedures or patient groups."
+        )
     return f"""RETRIEVED PASSAGE (every sentence is numbered):
 ═════════════════════════════════════════════════════════════
 {numbered_passage}
 ═════════════════════════════════════════════════════════════
-
+{focus_text}
 Write the detailed summary now. Put each paragraph on its own line and end it with the numbers of the passage sentences it is based on, in square brackets, for example [2, 5]. Every paragraph must end with such numbers. Use only facts and terms that appear in the passage, and no headings, bullet points or other text. If the passage does not contain enough information for a meaningful summary, reply only: {INSUFFICIENT_TEXT}"""
 
 
