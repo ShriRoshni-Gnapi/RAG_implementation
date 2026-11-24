@@ -33,12 +33,13 @@ class Sentence(NamedTuple):
         """
         Safe to offer and print: complete, free of glued headings, not a
         question (history-taking prompts in the books), not a run-on that
-        merges list items or headings into one 'sentence', and not a sentence
-        that depends on the one before it.
+        merges list items or headings into one 'sentence', not a caption or
+        heading cut out as a 'sentence', and not a sentence that depends on the
+        one before it.
         """
         return (self.complete and not self.heading
                 and not _QUESTION.search(self.text) and not _is_run_on(self.text)
-                and not _depends_on_previous(self.text))
+                and not _is_fragment(self.text) and not _depends_on_previous(self.text))
 
 
 def hit_text(hit: Dict[str, Any]) -> str:
@@ -158,6 +159,45 @@ def _is_run_on(text: str) -> bool:
     return len(text) > _RUN_ON_MIN_CHARS and len(_CASE_JUMP.findall(text)) >= _RUN_ON_JUMPS
 
 
+# A figure caption, a section heading or a label that the extraction cut out as a
+# "sentence" has no verb: "Lateral patellar glide test.", "Lateral Pull Test.",
+# "Figure 4-50.", "(Fig. 7.5).", "MED.". Only these three shapes are treated as
+# fragments, so a short real sentence ("Check foot posture.", "The patella moves
+# laterally.") is never dropped for being short.
+_VERBS = frozenset({
+    "is", "are", "was", "were", "be", "been", "being", "am", "has", "have", "had", "can", "could", "may",
+    "might", "will", "would", "should", "must", "shall", "do", "does", "did",
+    "shows", "show", "illustrates", "illustrate", "depicts", "demonstrates", "displays", "indicates",
+    "indicate", "signifies", "signify",
+})
+_CAPTION_START = re.compile(r"^\(?(?:Figure|Fig|Table|Box|Plate)\b\.?\s*\d")
+_SHOUTED_LABEL = re.compile(r"^[A-Z]{2,}[.:]?$")
+# A short phrase ending in one of these is a heading ("Medial Glide Test.") unless it opens
+# with a command ("Perform the Lachman test.").
+_HEADING_NOUNS = frozenset({
+    "test", "sign", "maneuver", "manoeuvre", "view", "technique", "procedure", "position", "exercise",
+    "scale", "score", "index", "classification", "grade", "syndrome", "disorder", "examination",
+    "assessment", "measurement", "method", "approach", "protocol", "stage", "phase",
+})
+_COMMAND_OPENERS = frozenset({
+    "perform", "use", "apply", "repeat", "administer", "conduct", "complete", "begin", "start", "stop",
+    "ask", "ensure", "check", "assess", "measure", "palpate", "observe", "record", "note", "avoid", "compare",
+})
+_MAX_HEADING_WORDS = 5
+
+
+def _is_fragment(text: str) -> bool:
+    if _SHOUTED_LABEL.match(text.strip()):
+        return True
+    words = [w.lower() for w in re.findall(r"[A-Za-z]+", text)]
+    if not words or any(w in _VERBS for w in words):
+        return False
+    if _CAPTION_START.match(text):
+        return True
+    return (len(words) <= _MAX_HEADING_WORDS and words[-1] in _HEADING_NOUNS
+            and words[0] not in _COMMAND_OPENERS)
+
+
 # --------------------------------------------------------------------------
 # Sentence splitting
 # --------------------------------------------------------------------------
@@ -268,6 +308,7 @@ _RULE_NAMES = (
     "_HEAD_THEN_NUMBER", "_MIN_HEAD_LETTERS", "_MIN_HEAD_WORD_LETTERS", "_CAPS_RUN_ANY", "_CHAPTER_START",
     "_HEADING_THEN_SENTENCE", "_TITLE_RUN", "_JOINER", "_DEPENDENT_START", "_SELF_CONTAINED_THIS", "_EMPTY_IT",
     "_QUESTION", "MAX_SENTENCE_CHARS", "_RUN_ON_MIN_CHARS", "_RUN_ON_JUMPS", "_CASE_JUMP",
+    "_VERBS", "_CAPTION_START", "_SHOUTED_LABEL", "_HEADING_NOUNS", "_COMMAND_OPENERS", "_MAX_HEADING_WORDS",
 )
 
 

@@ -793,6 +793,58 @@ class NoiseFilters(unittest.TestCase):
                      "Range of Motion and Flexibility Testing Protocols are described in this chapter for the knee."):
             self.assertFalse(usable(text), text)
 
+    def test_captions_headings_and_labels_are_not_offered_as_sentences(self):
+        for text in ("Lateral patellar glide test.", "Lateral Pull Test.", "Medial Glide Test.", "MED.",
+                     "Figure 4-50.", "(Fig. 7.5).", "Figure 12-130 Lateral pull test in the supine position.",
+                     "Table 3.2 Grades of patellar mobility.", "Examination.", "Special tests:"):
+            self.assertFalse(usable(text), text)
+
+    def test_short_real_sentences_are_kept(self):
+        for text in ("Check foot posture.", "Pain increases on stairs.", "The patella moves laterally.",
+                     "Swelling occurs after walking.", "Perform the Lachman test.", "Use the McMurray test.",
+                     "Repeat the test on the other side.", "Rest is advised.",
+                     "Figure 12-130 shows the position of the examiner's hand.",
+                     "Pain indicates a positive test."):
+            self.assertTrue(usable(text), text)
+
+    def test_the_real_medial_glide_passage_offers_sentences_and_not_its_fragments(self):
+        passage = (
+            "to treat patellar instability. A common complication of this procedure incorrectly used for "
+            "instability is iatrogenic medial patellar subluxation or instability. PFJRFs (Fig. 4-44) increase "
+            "with flexion of the knee from 0.5 times body weight during level walking to 3 to 4 times body "
+            "weight during stairclimbing to 7 to 8 times body weight with squatting. Females generally have a "
+            "greater Q-angle than males. However, critical review of available studies found no evidence that "
+            "Q-angle measures correlated with the presence or severity of anterior knee pain. This signals "
+            "lateral patellar instability. The patella is centered on the trochlear groove and medial "
+            "translation from this \"zero\" point is measured in millimeters. Greater than 10 mm of translation "
+            "is abnormal. Six to 10 mm of translation is considered normal. MED. Figure 4-50. "
+            "Lateral patellar glide test.")
+        offered = [s.text for s in sentences_for(passage) if s.usable]
+        for fragment in ("MED.", "Figure 4-50.", "Lateral patellar glide test."):
+            self.assertNotIn(fragment, offered)
+        for sentence in ("Females generally have a greater Q-angle than males.",
+                         "Greater than 10 mm of translation is abnormal.",
+                         "Six to 10 mm of translation is considered normal."):
+            self.assertIn(sentence, offered)
+        self.assertEqual(offered, [
+            "A common complication of this procedure incorrectly used for instability is iatrogenic medial "
+            "patellar subluxation or instability.",
+            "PFJRFs (Fig. 4-44) increase with flexion of the knee from 0.5 times body weight during level "
+            "walking to 3 to 4 times body weight during stairclimbing to 7 to 8 times body weight with squatting.",
+            "Females generally have a greater Q-angle than males.",
+            "The patella is centered on the trochlear groove and medial translation from this \"zero\" point is "
+            "measured in millimeters.",
+            "Greater than 10 mm of translation is abnormal.",
+            "Six to 10 mm of translation is considered normal."])
+        # dropped on purpose: the cut first sentence, "However…", "This signals…" and the three fragments
+
+    def test_a_fragment_is_never_picked_and_never_printed(self):
+        text = "Greater than 10 mm of translation is abnormal. Lateral patellar glide test. MED."
+        engine, llm = make_engine(lambda p: [hit("a1", text)], "Source 1: 1, 2, 3")
+        out = engine.find_references(RIGHT_KNEE_NOTE)
+        self.assertEqual(out["references"].split("\n")[1:], ['"Greater than 10 mm of translation is abnormal."'])
+        self.assertNotIn("glide test", llm.calls[0]["user_prompt"])
+
     def test_real_run_filters_out_exactly_the_noise(self):
         text = " ".join([RUN_ON, GLUED_HEADING, *QUESTIONS, *TITLE_HEADINGS, *DEPENDENT, *KEPT])
         offered = [s.text for s in sentences_for(text) if s.usable]
