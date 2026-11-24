@@ -2,28 +2,29 @@
 Passage text handling for SOAP reference mode.
 
 Stored passages come from PDF extraction, so they carry page furniture
-(running heads and page numbers), words split at line wraps, and chunk edges
-that cut a sentence in half. This module turns one stored passage into
-numbered sentences for selection and printing.
+(running heads and page numbers) and chunk edges that cut a sentence in half.
+This module turns one stored passage into numbered sentences.
 
-It never calls a model and never adds words. It only
-  * removes recognisable page furniture (page number + running head),
-  * rejoins a word split by a line wrap when the joined word appears intact
-    elsewhere in the retrieved passages, and
-  * marks sentences whose start or end is cut off.
-Everything else is the stored text, unchanged.
+It never calls a model and never rewrites a word. Page furniture is only used
+to find where a page break fell; a sentence touching a page break or a chunk
+edge is flagged as cut, so the caller can leave it out instead of printing
+half a sentence. Every sentence returned is a slice of the stored text
+(whitespace collapsed to single spaces).
 """
 
 import re
-from collections import Counter
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Set
 
 
 class Sentence(NamedTuple):
     """One sentence of a stored passage."""
     text: str
-    cut_start: bool = False   # the passage resumes mid-sentence here
-    cut_end: bool = False     # the passage stops mid-sentence here
+    cut_start: bool = False   # the sentence began before this passage / before a page break
+    cut_end: bool = False     # the sentence continues after this passage / after a page break
+
+    @property
+    def complete(self) -> bool:
+        return not (self.cut_start or self.cut_end)
 
 
 def hit_text(hit: Dict[str, Any]) -> str:
@@ -56,50 +57,6 @@ def _mark_page_furniture(text: str) -> str:
 
     text = _NUMBER_THEN_HEAD.sub(drop, text)
     return _HEAD_THEN_NUMBER.sub(drop, text)
-
-
-# --------------------------------------------------------------------------
-# Words split by a line wrap
-# --------------------------------------------------------------------------
-
-def build_vocab(texts: Iterable[str]) -> Counter:
-    """Word counts over the retrieved passages, used to confirm a rejoin."""
-    vocab: Counter = Counter()
-    for t in texts:
-        vocab.update(w.lower() for w in re.findall(r"[A-Za-z]{2,}", t))
-    return vocab
-
-
-_WORD = re.compile(r"[A-Za-z]{2,}")
-
-
-def repair_split_words(text: str, vocab: Counter, known_min: int = 2) -> str:
-    """
-    Rejoin 'patel lofemoral' -> 'patellofemoral'.
-
-    Two neighbouring words (one space apart, the second all lower-case) are
-    joined only when the joined word occurs at least `known_min` times in the
-    retrieved passages AND the two pieces are not both ordinary words there.
-    Pairs such as 'in to' or 'knee cap' are left alone, and a word that does
-    not appear intact anywhere is never guessed.
-    """
-    words = list(_WORD.finditer(text))
-    out: List[str] = []
-    pos = i = 0
-    while i < len(words):
-        a = words[i]
-        b = words[i + 1] if i + 1 < len(words) else None
-        if b and text[a.end():b.start()] == " " and b.group().islower():
-            first, second = a.group(), b.group()
-            both_words = vocab.get(first.lower(), 0) >= known_min and vocab.get(second, 0) >= known_min
-            if vocab.get((first + second).lower(), 0) >= known_min and not both_words:
-                out.append(text[pos:a.start()] + first + second)
-                pos = b.end()
-                i += 2
-                continue
-        i += 1
-    out.append(text[pos:])
-    return "".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -150,37 +107,36 @@ def split_text(text: str) -> List[str]:
     return out
 
 
-def sentences_for(text: str, vocab: Optional[Counter] = None) -> List[Sentence]:
+def sentences_for(text: str) -> List[Sentence]:
     """
-    A stored passage as numbered sentences.
+    A stored passage as sentences, each flagged when it is cut off.
 
-    Page furniture is removed. A sentence interrupted by a page break is
-    rejoined. A sentence that starts or stops mid-thought is flagged so the
-    printed excerpt shows '[...]' there.
+    A sentence is cut at the start when it begins in lower case at the start
+    of the passage or right after a page break, and cut at the end when it
+    has no closing punctuation at the end of the passage or right before a
+    page break. Nothing is joined or rewritten.
     """
     text = _mark_page_furniture(" ".join((text or "").split()))
-    if vocab:
-        text = repair_split_words(text, vocab)
 
     frags: List[str] = []
-    resumed_after_break: Set[int] = set()
+    after_break: Set[int] = set()       # fragments that start right after a page break
+    before_break: Set[int] = set()      # fragments that end right before a page break
     for b, block in enumerate(re.split(rf"\s*{_PAGE_BREAK}\s*", text)):
         parts = split_text(block)
         if not parts:
             continue
-        starts_lower = parts[0][:1].islower()
-        if b and frags and starts_lower and not _TERMINAL.search(frags[-1]):
-            frags[-1] = f"{frags[-1]} {parts.pop(0)}"       # page break inside a sentence
-        elif b and starts_lower:
-            resumed_after_break.add(len(frags))
+        if b and frags:
+            before_break.add(len(frags) - 1)
+        if b:
+            after_break.add(len(frags))
         frags.extend(parts)
 
     last = len(frags) - 1
     return [
         Sentence(
             text=f,
-            cut_start=f[:1].islower() and (i == 0 or i in resumed_after_break),
-            cut_end=(i == last and not _TERMINAL.search(f)),
+            cut_start=f[:1].islower() and (i == 0 or i in after_break),
+            cut_end=(i == last or i in before_break) and not _TERMINAL.search(f),
         )
         for i, f in enumerate(frags)
     ]

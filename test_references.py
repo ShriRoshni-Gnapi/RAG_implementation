@@ -6,12 +6,13 @@ Live:  PT_RAG_LIVE=1 python3 -m unittest test_references.LiveModelCheck -v
 
 Unit tests use a MOCKED model and MOCKED search results. They prove the
 plumbing: query building, ranking, validation of ids, grouping, de-duplication,
-text cleanup and printing. They do NOT prove that the real model picks the
+sentence handling and printing. They do NOT prove that the real model picks the
 right sentences or that the real Qdrant data ranks well; only the live check
 (which needs Qdrant, the embedding model and the LLM server) can show that.
 """
 
 import os
+import re
 import sys
 import types
 import unittest
@@ -28,18 +29,21 @@ except ImportError:
 
 import query_engine as qe
 from citations import (
-    build_reference_entries, chapter_and_section, extract_source_sentences,
+    build_reference_entries, chapter_and_section, citation_line, extract_source_sentences,
     format_reference_list, page_text,
 )
-from passages import build_vocab, repair_split_words, sentences_for, split_text
+from passages import sentences_for, split_text
 from prompts import NO_REFERENCE_TEXT
 
 RIGHT_KNEE_NOTE = """S: 54-year-old reports right knee pain for 3 weeks, worse going up and down stairs and after prolonged sitting with knees bent. Pain rated 6/10 at worst and 2/10 at rest. Reports occasional swelling after long walks and a feeling of the knee giving way on stairs. No history of trauma. Difficulty rising from a low chair.
 O: Observation: mild effusion over the right knee, no redness. Gait: antalgic with reduced stance time on the right. Palpation: tenderness along the medial and lateral patellar borders. Range of motion: right knee flexion 0-110 degrees, left 0-135 degrees; extension lacks 5 degrees on the right. Strength: quadriceps 4/5 right, 5/5 left; hip abductors 4/5 right. Patellar tracking: lateral deviation during active extension. Special tests: patellar grind test positive, Lachman test negative, McMurray test negative. Single-leg squat shows dynamic knee valgus.
 A: Findings are consistent with patellofemoral pain with quadriceps and hip abductor weakness, reduced knee flexion range, and altered patellar tracking. No signs of ligamentous instability. Functional limitation with stair negotiation and sitting tolerance."""
 
-PF_TEXT = ("Patellofemoral pain is often worse on stairs. Weakness of the hip abductors is common. "
-           "The patient may report pain after prolonged sitting with the knees flexed. Check foot posture.")
+S1 = "Patellofemoral pain is often worse on stairs."
+S2 = "Weakness of the hip abductors is common."
+S3 = "The patient may report pain after prolonged sitting with the knees flexed."
+S4 = "Check foot posture."
+PF_TEXT = " ".join([S1, S2, S3, S4])
 OA_TEXT = "The pain is worse on movement and locomotion. She is unable to walk far because of stiffness."
 OTHER_TEXT = "Stairs are used in ankle fracture rehabilitation. Swelling after hip surgery is common."
 
@@ -78,6 +82,10 @@ def make_engine(results_for, reply):
     return engine, llm
 
 
+def quoted(*sentences):
+    return "\n".join(f'"{s}"' for s in sentences)
+
+
 # --------------------------------------------------------------------------
 # The 15 required scenarios
 # --------------------------------------------------------------------------
@@ -87,21 +95,16 @@ class RequiredScenarios(unittest.TestCase):
     def test_01_complete_note_with_relevant_reference(self):
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1, 2")
         out = engine.find_references(RIGHT_KNEE_NOTE)
-        ref = out["references"]
-        self.assertIn("1. Book A", ref)
-        self.assertIn("Author: A. Author", ref)
-        self.assertIn("Chapter: Chapter 21: The Knee", ref)
-        self.assertIn("Pages: 687–758 (section range)", ref)
-        self.assertIn("Excerpt: Patellofemoral pain is often worse on stairs. "
-                      "Weakness of the hip abductors is common.", ref)
-        for banned in ("Subjective", "Objective", "Assessment", "diagnos", "treatment"):
-            self.assertNotIn(banned, ref)
+        self.assertEqual(
+            out["references"],
+            "1. Book A — A. Author, Chapter: Chapter 21: The Knee, pp. 687–758\n" + quoted(S1, S2))
         self.assertEqual(out["source_indices"], [1])
 
     def test_02_long_note_information_near_the_end(self):
         filler = " ".join(f"Patient reports general fatigue on day {i}." for i in range(60))
         note = f"S: {filler}\nO: Patellar grind test positive."
-        tail_hit = hit("tail", "The patellar grind test is positive in chondromalacia. Compress the patella.")
+        tail = "The patellar grind test is positive in chondromalacia."
+        tail_hit = hit("tail", f"{tail} Compress the patella.")
         engine, _ = make_engine(
             lambda p: [tail_hit] if "grind test" in p else [hit("noise", OTHER_TEXT, 0.4)],
             "Source 1: 1")
@@ -109,47 +112,47 @@ class RequiredScenarios(unittest.TestCase):
         self.assertGreater(len(engine.queries), 3)
         self.assertTrue(all(len(q) <= qe.NOTE_SEGMENT_CHARS for q in engine.queries))
         self.assertTrue(any("grind test" in q for q in engine.queries))   # the end was searched
-        self.assertIn("The patellar grind test is positive in chondromalacia.", out["references"])
+        self.assertIn(f'"{tail}"', out["references"])
 
     def test_03_only_subjective(self):
         note = "S: Right knee pain on stairs for 3 weeks. Swelling after long walks."
         self.assertEqual([l for l, _ in qe.parse_soap_sections(note)], ["S"])
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1")
-        self.assertIn("Excerpt:", engine.find_references(note)["references"])
+        self.assertIn(f'"{S1}"', engine.find_references(note)["references"])
         self.assertTrue(engine.queries)
 
     def test_04_only_objective(self):
         note = "Objective: Knee flexion 0-110 degrees. Quadriceps 4/5. Patellar grind test positive."
         self.assertEqual([l for l, _ in qe.parse_soap_sections(note)], ["O"])
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 2")
-        self.assertIn("Weakness of the hip abductors is common.", engine.find_references(note)["references"])
+        self.assertIn(f'"{S2}"', engine.find_references(note)["references"])
 
     def test_05_only_assessment(self):
         note = "A: Findings consistent with patellofemoral pain with hip abductor weakness."
         self.assertEqual([l for l, _ in qe.parse_soap_sections(note)], ["A"])
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1")
-        self.assertIn("Excerpt:", engine.find_references(note)["references"])
+        self.assertIn(f'"{S1}"', engine.find_references(note)["references"])
 
     def test_06_duplicate_passages_from_multiple_queries(self):
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1, 2")
         out = engine.find_references(RIGHT_KNEE_NOTE)
         self.assertGreater(len(engine.queries), 2)                 # retrieved by every piece
         self.assertEqual(out["retrieved_count"], 1)
-        self.assertEqual(out["references"].count("Patellofemoral pain is often worse on stairs."), 1)
+        self.assertEqual(out["references"].count(S1), 1)
 
     def test_06b_overlapping_chunks_do_not_repeat_a_sentence(self):
-        a = hit("bk_00001", "Intro text here. Weakness of the hip abductors is common.")
-        b = hit("bk_00002", "Weakness of the hip abductors is common. Another point follows.")
-        sents = [sentences_for(a["content"]), sentences_for(b["content"])]
+        a = hit("bk_00001", f"Intro text here. {S2}")
+        b = hit("bk_00002", f"{S2} Another point follows.")
+        sents = [[s for s in sentences_for(h["content"])] for h in (a, b)]
         entries = build_reference_entries([a, b], sents, {1: [1, 2], 2: [1, 2]})
         text = format_reference_list(entries)
-        self.assertEqual(text.count("Weakness of the hip abductors is common."), 1)
-        self.assertIn("Another point follows.", text)
+        self.assertEqual(text.count(S2), 1)
+        self.assertIn('"Another point follows."', text)
 
     def test_07_similar_terms_but_unrelated_passage_is_left_out(self):
-        engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT), hit("z9", OTHER_TEXT, book_id="zz",
-                                                                 book_title="Ankle Book")],
-                                "Source 1: 1")      # mocked model judges Source 2 unrelated
+        engine, _ = make_engine(
+            lambda p: [hit("a1", PF_TEXT), hit("z9", OTHER_TEXT, book_id="zz", book_title="Ankle Book")],
+            "Source 1: 1")      # mocked model judges Source 2 unrelated
         ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
         self.assertNotIn("Ankle Book", ref)
         self.assertNotIn("ankle fracture", ref)
@@ -159,62 +162,69 @@ class RequiredScenarios(unittest.TestCase):
                                 "Source 99: 1\nSource 0: 2\nSource 1: 1\nsource 1: 3")
         out = engine.find_references(RIGHT_KNEE_NOTE)
         self.assertEqual(out["source_indices"], [1])
-        self.assertEqual(out["references"].count("Excerpt:"), 1)
-        self.assertNotIn("Check foot posture", out["references"])   # 'source 1: 3' ignored: first label wins
+        self.assertEqual(out["references"].count('"'), 2)           # one quoted sentence
+        self.assertNotIn(S3, out["references"])                      # 'source 1: 3' ignored: first label wins
 
     def test_09_invalid_sentence_numbers(self):
         engine, _ = make_engine(
             lambda p: [hit("a1", PF_TEXT), hit("b2", OA_TEXT, book_id="oa", book_title="OA Book")],
             "Source 1: 99, 0, 2\nSource 2: 77")
         out = engine.find_references(RIGHT_KNEE_NOTE)
-        self.assertIn("Weakness of the hip abductors is common.", out["references"])
-        self.assertNotIn("Patellofemoral pain is often worse", out["references"])
+        self.assertIn(f'"{S2}"', out["references"])
+        self.assertNotIn(S1, out["references"])
         self.assertNotIn("OA Book", out["references"])               # no valid sentence -> nothing shown
         self.assertEqual(out["dropped_sources"], [2])
 
-    def test_10_missing_author_and_page_metadata(self):
+    def test_10_missing_author_chapter_and_page_metadata(self):
         h = hit("a1", PF_TEXT, author=None, page_start=None, page_end=None, chapter=None)
         engine, _ = make_engine(lambda p: [h], "Source 1: 1")
         ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
-        self.assertNotIn("Author:", ref)
-        self.assertNotIn("Chapter:", ref)
+        self.assertEqual(ref, "1. Book A\n" + quoted(S1))            # nothing invented, no placeholders
         self.assertNotIn("None", ref)
-        self.assertIn("Pages: not recorded", ref)
+        self.assertNotIn("not recorded", ref)
 
     def test_11_headers_and_footers_inside_text(self):
         text = ("Do not sit with the knees flexed for long periods. Muscles can control 712 PATELLOFEMORAL "
                 "DYSFUNCTION: NONOPERATIVE MANAGEMENT knee function without symptoms. "
                 "Next point. NONOPERATIVE MANAGEMENT PATELLOFEMORAL 713 A 12 ACL PCL tears were noted.")
-        got = [s.text for s in sentences_for(text)]
-        joined = " ".join(got)
-        self.assertNotIn("PATELLOFEMORAL", joined)
-        self.assertNotIn("713", joined)
-        self.assertIn("Muscles can control knee function without symptoms.", got)   # rejoined across the break
-        self.assertIn("12 ACL PCL tears were noted.", joined)                       # real text kept
+        sents = sentences_for(text)
+        complete = [s.text for s in sents if s.complete]
+        self.assertEqual(complete, ["Do not sit with the knees flexed for long periods.", "Next point.",
+                                    "A 12 ACL PCL tears were noted."])      # real "12 ACL PCL" text kept
+        self.assertNotIn("PATELLOFEMORAL", " ".join(s.text for s in sents))   # furniture never in a sentence
+        cut = [s.text for s in sents if not s.complete]
+        self.assertEqual(cut, ["Muscles can control", "knee function without symptoms."])   # halves of the broken sentence
 
-    def test_12_broken_words_and_incomplete_sentences(self):
-        vocab = build_vocab(["patellofemoral pain patellofemoral joint patellofemoral dysfunction",
-                             "in the knee to the hip", "swell ing here"])
-        fixed = repair_split_words("Recurrent swelling may relate to patel lofemoral dysfunction, in to the knee.", vocab)
-        self.assertIn("patellofemoral dysfunction", fixed)
-        self.assertIn("in to the knee", fixed)                         # two real words: not joined
-        self.assertIn("extrava sates", repair_split_words("fluid extrava sates here", vocab))  # never guessed
-        sents = sentences_for("symptoms. Complete sentence here. Another that stops mid")
-        self.assertTrue(sents[0].cut_start)                           # starts mid-thought
-        self.assertFalse(sents[1].cut_start or sents[1].cut_end)
-        self.assertTrue(sents[2].cut_end)                             # stops mid-thought
-        entry = build_reference_entries([hit("a1", "x")], [sents], {1: [1, 3]})
-        self.assertIn("Excerpt: [...] symptoms. [...] Another that stops mid [...]", format_reference_list(entry))
+    def test_12_broken_words_stay_verbatim_and_incomplete_sentences_are_not_offered(self):
+        text = ("symptoms. Recurrent swelling may relate to patel lofemoral dysfunction. "
+                "Fluid extrava sates here. Another that stops mid")
+        sents = sentences_for(text)
+        self.assertEqual([(s.cut_start, s.cut_end) for s in sents],
+                         [(True, False), (False, False), (False, False), (False, True)])
+        engine, llm = make_engine(lambda p: [hit("a1", text)], "Source 1: 1, 2")
+        out = engine.find_references(RIGHT_KNEE_NOTE)
+        prompt = llm.calls[0]["user_prompt"]
+        self.assertNotIn("symptoms.", prompt)                          # cut at the start: not offered
+        self.assertNotIn("stops mid", prompt)                          # cut at the end: not offered
+        self.assertEqual(out["references"].split("\n")[1:],
+                         ['"Recurrent swelling may relate to patel lofemoral dysfunction."',
+                          '"Fluid extrava sates here."'])               # the book's own spelling, not rewritten
 
     def test_13_multiple_passages_same_chapter(self):
-        a = hit("bk_00002", "Second passage sentence here. Extra.", section_path="Ch 5 > Knee > Gait", page_start="10", page_end="20")
-        b = hit("bk_00001", "First passage sentence here. Extra.", section_path="Ch 5 > Knee > Gait", page_start="10", page_end="20")
-        c = hit("bk_00009", "Other section sentence here. Extra.", section_path="Ch 5 > Hip > Gait", page_start="30", page_end="40")
-        sents = [sentences_for(h["content"]) for h in (a, b, c)]
-        entries = build_reference_entries([a, b, c], sents, {1: [1], 2: [1], 3: [1]})
-        self.assertEqual(len(entries), 2)                              # same section merged, other section apart
-        self.assertEqual(entries[0]["excerpts"], ["First passage sentence here.", "Second passage sentence here."])
-        self.assertEqual(entries[1]["excerpts"], ["Other section sentence here."])
+        kw = dict(section_path="Ch 5 > Knee > Gait", page_start="10", page_end="20")
+        a = hit("bk_00002", "Second passage sentence here. Extra.", **kw)
+        b = hit("bk_00001", "First passage sentence here. Extra.", **kw)
+        c = hit("bk_00009", "Other section sentence here. Extra.", section_path="Ch 5 > Hip > Gait",
+                page_start="30", page_end="40")
+        d = hit("bk_00005", "Same section later pages here. Extra.", page_start="50", page_end="60",
+                section_path="Ch 5 > Knee > Gait")
+        sents = [sentences_for(h["content"]) for h in (a, b, c, d)]
+        entries = build_reference_entries([a, b, c, d], sents, {1: [1], 2: [1], 3: [1], 4: [1]})
+        self.assertEqual([e["sentences"] for e in entries],
+                         [["First passage sentence here.", "Second passage sentence here."],
+                          ["Other section sentence here."],
+                          ["Same section later pages here."]])        # a change of section or pages = new citation
+        self.assertEqual([e["pages"] for e in entries], ["pp. 10–20", "pp. 30–40", "pp. 50–60"])
 
     def test_14_no_relevant_references(self):
         engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], NO_REFERENCE_TEXT)
@@ -239,6 +249,55 @@ class RequiredScenarios(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Output format (academic-style citations)
+# --------------------------------------------------------------------------
+
+class OutputFormat(unittest.TestCase):
+
+    def test_citation_line_has_only_known_parts(self):
+        full = {"book": "T", "author": "A. Au", "chapter": "Ch 1", "section": "Gait", "pages": "pp. 1–2"}
+        self.assertEqual(citation_line(1, full), "1. T — A. Au, Chapter: Ch 1, Section: Gait, pp. 1–2")
+        self.assertEqual(citation_line(2, {**full, "author": None, "section": None}),
+                         "2. T — Chapter: Ch 1, pp. 1–2")
+        self.assertEqual(citation_line(3, {**full, "chapter": None, "section": None, "pages": "p. 7"}),
+                         "3. T — A. Au, p. 7")
+        self.assertEqual(citation_line(4, {"book": "T", "author": None, "chapter": None,
+                                           "section": None, "pages": None}), "4. T")
+
+    def test_only_citation_lines_and_quoted_sentences_with_no_omission_markers(self):
+        engine, _ = make_engine(
+            lambda p: [hit("a1", PF_TEXT), hit("b2", OA_TEXT, book_id="oa", book_title="OA Book", author=None,
+                                              page_start="186", page_end="186", chapter="Chapter 7")],
+            "Source 1: 1, 3\nSource 2: 2")
+        ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
+        lines = ref.split("\n")
+        self.assertEqual(lines, [
+            "1. Book A — A. Author, Chapter: Chapter 21: The Knee, pp. 687–758", f'"{S1}"', f'"{S3}"',
+            "2. OA Book — Chapter: Chapter 7, p. 186", '"She is unable to walk far because of stiffness."'])
+        for banned in ("[...]", "...", "…", "Excerpt", "Summary", "Author:", "Pages:", "Subjective"):
+            self.assertNotIn(banned, ref)
+        for line in lines:
+            self.assertTrue(re.match(r"^\d+\. ", line) or (line.startswith('"') and line.endswith('"')), line)
+
+    def test_cut_sentences_are_never_printed(self):
+        text = "starts mid thought here. A complete sentence stands here. Ends before the next chunk"
+        engine, llm = make_engine(lambda p: [hit("a1", text)], "Source 1: 1, 2, 3")
+        ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
+        self.assertEqual(ref.split("\n")[1:], ['"A complete sentence stands here."'])
+        self.assertNotIn("starts mid thought", llm.calls[0]["user_prompt"])
+        # a passage with nothing complete is dropped instead of printed
+        engine2, llm2 = make_engine(lambda p: [hit("a1", "only a fragment that never ends")], "Source 1: 1")
+        self.assertEqual(engine2.find_references(RIGHT_KNEE_NOTE)["references"], NO_REFERENCE_TEXT)
+        self.assertEqual(llm2.calls, [])
+
+    def test_page_text(self):
+        self.assertEqual(page_text(hit("a", "x", page_start="186", page_end="186")), "p. 186")
+        self.assertEqual(page_text(hit("a", "x", page_start="687", page_end="758")), "pp. 687–758")
+        self.assertEqual(page_text(hit("a", "x", page_start="7", page_end=None)), "p. 7")
+        self.assertIsNone(page_text(hit("a", "x", page_start=None, page_end=None)))
+
+
+# --------------------------------------------------------------------------
 # Supporting behaviour
 # --------------------------------------------------------------------------
 
@@ -249,7 +308,7 @@ class SupportingBehaviour(unittest.TestCase):
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], reply)
         ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
         self.assertNotIn("caused by weak quadriceps", ref)
-        self.assertIn("Weakness of the hip abductors is common.", ref)
+        self.assertIn(f'"{S2}"', ref)
 
     def test_ranges_in_the_model_reply(self):
         self.assertEqual(extract_source_sentences("Source 1: 2-4, 7", [9]), {1: [2, 3, 4, 7]})
@@ -285,10 +344,8 @@ class SupportingBehaviour(unittest.TestCase):
         self.assertTrue(any(p.split(". ")[-1] in pieces[i + 1] for i, p in enumerate(pieces[:-1])))   # overlap
 
     def test_one_very_long_word_run_is_split_at_spaces(self):
-        text = " ".join(["knee"] * 400)
-        pieces = qe.split_note(text, 100)
-        self.assertTrue(all(len(p) <= 100 and not p.startswith("kne ") for p in pieces))
-        self.assertTrue(all(set(p.split()) == {"knee"} for p in pieces))
+        pieces = qe.split_note(" ".join(["knee"] * 400), 100)
+        self.assertTrue(all(len(p) <= 100 and set(p.split()) == {"knee"} for p in pieces))
 
     def test_sentence_splitter_abbreviations_decimals_and_references(self):
         text = ("Load rises from 0.5 times body weight to 3 times (Fig. 5-29), as shown by Smith et al. in 1999. "
@@ -310,11 +367,6 @@ class SupportingBehaviour(unittest.TestCase):
         self.assertEqual(chapter_and_section(scan, "Handbook"), ("06", None))     # scanner junk not shown
         root = hit("r", "x", chapter="Case Studies", section="None", section_path=None)
         self.assertEqual(chapter_and_section(root, "Case Studies"), (None, None))
-
-    def test_page_text(self):
-        self.assertEqual(page_text(hit("a", "x", page_start="186", page_end="186")), "Page: 186")
-        self.assertEqual(page_text(hit("a", "x", page_start="7", page_end=None)), "Page: 7")
-        self.assertEqual(page_text(hit("a", "x", page_start=None, page_end=None)), "Pages: not recorded")
 
     def test_json_result_keeps_existing_keys(self):
         engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1")
@@ -340,6 +392,8 @@ class LiveModelCheck(unittest.TestCase):
         # the model must answer in the 'Source N: numbers' format or say there is no match
         self.assertTrue(out["source_indices"] or NO_REFERENCE_TEXT in out["raw_answer"]
                         or out["retrieved_count"] == 0, "model did not follow the Source N format")
+        for banned in ("[...]", "…", "Excerpt"):
+            self.assertNotIn(banned, out["references"])
         # soft check for a human: the osteoarthrosis / left-knee case should not be listed
         if "Rheumatic conditions" in out["references"] or "OSTEOARTHROSIS" in out["references"]:
             print("WARNING: the osteoarthrosis passage is still listed")

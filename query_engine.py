@@ -39,7 +39,7 @@ from prompts import (
     build_reference_user_prompt,
     assemble_numbered_context,
 )
-from passages import build_vocab, hit_text, sentences_for, split_text
+from passages import hit_text, sentences_for, split_text
 from citations import (
     build_reference_entries,
     extract_source_sentences,
@@ -365,9 +365,9 @@ class PTQueryEngine:
         hits = self.retrieve_for_note(sections, top_k=top_k, max_sources=max_sources)
         retrieval_ms = (time.time() - t0) * 1000
 
-        vocab = build_vocab(hit_text(h) for h in hits)
-        numbered = [(h, sentences_for(hit_text(h), vocab)) for h in hits]
-        numbered = [(h, s) for h, s in numbered if s]          # passages with no usable sentence
+        # Only complete sentences are offered, so only complete sentences can be printed.
+        numbered = [(h, [s for s in sentences_for(hit_text(h)) if s.complete]) for h in hits]
+        numbered = [(h, s) for h, s in numbered if s]          # passages with no complete sentence
         hits = [h for h, _ in numbered]
         sentences = [s for _, s in numbered]
 

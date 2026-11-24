@@ -181,7 +181,6 @@ def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int,
 # Reference list: grouping, metadata and printing (all from stored data)
 # --------------------------------------------------------------------------
 
-_CUT = "[...]"
 _CHAPTER_LABEL = re.compile(r"^(?:chapter|ch\.?)\s+\w+|^\d{1,3}\b", re.I)
 _JUNK_LABEL = re.compile(r"^(?:scan|page|img|image)\d+$", re.I)
 _MISSING = (None, "", "None")
@@ -217,36 +216,16 @@ def chapter_and_section(hit: Dict[str, Any], title: str) -> Tuple[Optional[str],
     return chapter, " > ".join(dict.fromkeys(rest)) or None
 
 
-def page_text(hit: Dict[str, Any]) -> str:
+def page_text(hit: Dict[str, Any]) -> Optional[str]:
     """
-    Pages as stored. The stored range belongs to the whole section the passage
-    sits in, not to the passage itself, so a range is labelled as such.
+    'p. 186' or 'pp. 687–758' as stored, or None when no page is recorded.
+    The stored range belongs to the whole section the passage sits in.
     """
     start, end = hit.get("page_start"), hit.get("page_end")
     if start in _MISSING and end in _MISSING:
-        return "Pages: not recorded"
+        return None
     start, end = (start if start not in _MISSING else end), (end if end not in _MISSING else start)
-    if str(start) == str(end):
-        return f"Page: {start}"
-    return f"Pages: {start}–{end} (section range)"
-
-
-def _excerpt(sentences: List[Sentence], picked: List[int]) -> str:
-    """Picked sentences exactly as stored; '[...]' marks skipped or cut text."""
-    pieces: List[str] = []
-    prev = None
-    for k in picked:
-        s = sentences[k - 1]
-        if prev is not None and k != prev + 1:
-            pieces.append(_CUT)
-        text = s.text
-        if s.cut_start and not (pieces and pieces[-1] == _CUT):
-            text = f"{_CUT} {text}"
-        if s.cut_end:
-            text = f"{text} {_CUT}"
-        pieces.append(text)
-        prev = k
-    return " ".join(pieces)
+    return f"p. {start}" if str(start) == str(end) else f"pp. {start}–{end}"
 
 
 def _is_repeat(sentence: str, printed: List[str]) -> bool:
@@ -263,10 +242,10 @@ def build_reference_entries(
     """
     Reference entries from the validated picks.
 
-    Passages from the same book, chapter and section share one entry (one
-    heading, one excerpt per passage, in book order). Different sections of
-    the same chapter stay separate entries. A sentence already printed for
-    the same book (overlapping chunks) is not printed twice.
+    Passages with the same book, chapter, section and pages share one entry,
+    in book order. A change in any of those starts a new entry. A sentence
+    already printed for the same book (overlapping chunks) is not printed
+    twice. Each entry holds the picked sentences, unchanged.
     """
     groups: Dict[tuple, Dict[str, Any]] = {}
     for idx in sorted(i for i, p in picks.items() if p):
@@ -274,13 +253,14 @@ def build_reference_entries(
         meta = BOOKS.get(hit.get("book_id", ""), {})
         title = hit.get("book_title") or hit.get("book") or meta.get("title") or "Unknown book"
         chapter, section = chapter_and_section(hit, title)
-        key = (hit.get("book_id") or title, chapter, section)
+        pages = page_text(hit)
+        key = (hit.get("book_id") or title, chapter, section, pages)
         group = groups.setdefault(key, {
             "book": title,
             "author": hit.get("author") or meta.get("author"),
             "chapter": chapter,
             "section": section,
-            "pages": page_text(hit),
+            "pages": pages,
             "passages": [],
         })
         group["passages"].append((hit.get("chunk_id") or "", idx))
@@ -289,41 +269,45 @@ def build_reference_entries(
     printed: Dict[str, List[str]] = {}
     for key, group in groups.items():
         seen = printed.setdefault(str(key[0]), [])
-        excerpts, chunk_ids, sources = [], [], []
+        texts, chunk_ids, sources = [], [], []
         for chunk_id, idx in sorted(group.pop("passages")):
-            kept = []
-            for k in picks[idx]:
-                if not _is_repeat(sentences[idx - 1][k - 1].text, seen):
-                    kept.append(k)
-                    seen.append(_norm(sentences[idx - 1][k - 1].text))
+            kept = [sentences[idx - 1][k - 1].text for k in picks[idx]]
+            kept = [t for t in kept if not _is_repeat(t, seen)]
             if kept:
-                excerpts.append(_excerpt(sentences[idx - 1], kept))
+                seen.extend(_norm(t) for t in kept)
+                texts.extend(kept)
                 chunk_ids.append(chunk_id)
                 sources.append(idx)
-        if excerpts:
-            entries.append({**group, "excerpts": excerpts, "chunk_ids": chunk_ids, "sources": sources})
+        if texts:
+            entries.append({**group, "sentences": texts, "chunk_ids": chunk_ids, "sources": sources})
     return sorted(entries, key=lambda e: min(e["sources"]))
+
+
+def citation_line(number: int, entry: Dict[str, Any]) -> str:
+    """'1. Title — Author, Chapter: X, Section: Y, pp. 10–20' with only the known parts."""
+    details = [
+        entry["author"],
+        f"Chapter: {entry['chapter']}" if entry["chapter"] else None,
+        f"Section: {entry['section']}" if entry["section"] else None,
+        entry["pages"],
+    ]
+    known = [d for d in details if d]
+    return f"{number}. {entry['book']}" + (f" — {', '.join(known)}" if known else "")
 
 
 def format_reference_list(entries: List[Dict[str, Any]]) -> str:
     """
-    One combined reference list: title, author (if known), chapter, section
-    (if known), pages, and the original textbook sentences. Nothing in it is
-    written by the model.
+    Academic-style list: one citation line per entry, then each original
+    textbook sentence in quotation marks. Only complete stored sentences and
+    stored metadata appear; nothing is written by the model.
     """
     if not entries:
         return NO_REFERENCE_TEXT
-
-    blocks = []
+    lines: List[str] = []
     for n, e in enumerate(entries, 1):
-        lines = [f"{n}. {e['book']}"]
-        for label, value in (("Author", e["author"]), ("Chapter", e["chapter"]), ("Section", e["section"])):
-            if value:
-                lines.append(f"    {label}: {value}")
-        lines.append(f"    {e['pages']}")
-        lines.extend(f"    Excerpt: {x}" for x in e["excerpts"])
-        blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+        lines.append(citation_line(n, e))
+        lines.extend(f'"{s}"' for s in e["sentences"])
+    return "\n".join(lines)
 
 
 def format_citations_block(
