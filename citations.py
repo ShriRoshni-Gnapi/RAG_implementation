@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Set, Tuple, Optional
 
 from config import BOOKS_DIR, BOOKS
 from passages import Sentence
-from prompts import NO_REFERENCE_TEXT
+from prompts import NO_REFERENCE_TEXT, NO_SUMMARY_TEXT
 
 DISCLAIMER_TEXT = (
     "Clinical decision-making requires individual patient assessment."
@@ -302,7 +302,11 @@ def citation_line(number: int, entry: Dict[str, Any]) -> str:
     return f"{number}. {entry['book']}" + (f" — {', '.join(known)}" if known else "")
 
 
-def format_reference_list(entries: List[Dict[str, Any]], with_summary: bool = False) -> str:
+def format_reference_list(
+    entries: List[Dict[str, Any]],
+    with_summary: bool = False,
+    summary_only: bool = False,
+) -> str:
     """
     Academic-style list: one citation line per entry, then each original
     textbook sentence in quotation marks. The sentences and the metadata are
@@ -311,9 +315,19 @@ def format_reference_list(entries: List[Dict[str, Any]], with_summary: bool = Fa
     With with_summary the sentences sit under 'Original Sentences:' and an
     entry that has a checked summary gets a 'Detailed Summary:' section. That
     section is the only model-written text; an entry without one shows none.
+
+    With summary_only each entry shows just its citation line and its checked
+    summary. An entry without a supported summary is left out and the rest are
+    renumbered; if none has one, a single line says so.
     """
     if not entries:
         return NO_REFERENCE_TEXT
+    if summary_only:
+        summarised = [e for e in entries if e.get("summary")]
+        lines = []
+        for n, e in enumerate(summarised, 1):
+            lines.extend([citation_line(n, e), "Detailed Summary:", *e["summary"]])
+        return "\n".join(lines) if lines else NO_SUMMARY_TEXT
     lines: List[str] = []
     for n, e in enumerate(entries, 1):
         lines.append(citation_line(n, e))

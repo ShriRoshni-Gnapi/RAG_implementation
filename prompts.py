@@ -144,6 +144,7 @@ Instructions:
 Output only a combined list of relevant textbook references."""
 
 NO_REFERENCE_TEXT = "No matching reference was found."
+NO_SUMMARY_TEXT = "No supported summary was available for the retrieved references."
 
 # At most this many sentences are printed per source. The model is asked to stay
 # within it and extract_source_sentences enforces it. Raise it if a real run

@@ -381,6 +381,7 @@ class PTQueryEngine:
         top_k: Optional[int] = None,
         max_sources: int = 12,
         summaries: bool = False,
+        summary_only: bool = False,
     ) -> Dict[str, Any]:
         """
         SOAP note -> combined list of relevant textbook references.
@@ -393,8 +394,10 @@ class PTQueryEngine:
         With summaries=True each citation also gets a 'Detailed Summary' of
         its passage. That is the only model-written text; it is checked
         against the passage (see summaries.py) and left out when it cannot be
-        supported.
+        supported. summary_only=True (which implies summaries) prints just the
+        citation line and the summary.
         """
+        summaries = summaries or summary_only
         t0 = time.time()
         # Plan text is not used: the task reads S, O and A and gives no treatment.
         sections = [(label, body) for label, body in parse_soap_sections(soap_note) if label != "P"]
@@ -437,7 +440,7 @@ class PTQueryEngine:
                  entry["summary_passage"]) = self._summarize(entry, passages)
                 summary_notes.extend({"citation": n, **note} for note in notes)
         return {
-            "references": format_reference_list(entries, with_summary=summaries),
+            "references": format_reference_list(entries, with_summary=summaries, summary_only=summary_only),
             "summary_notes": summary_notes,
             "source_indices": sorted(i for i, p in picks.items() if p),
             "dropped_sources": sorted(i for i, p in picks.items() if not p),

@@ -153,13 +153,15 @@ def interactive_mode(book_key: str = None, top_k: int = 5):
             print(f"\n[Error] {type(e).__name__}: {e}\n")
 
 
-def run_reference_mode(path: str, top_k: int, json_mode: bool, summaries: bool = True) -> int:
+def run_reference_mode(path: str, top_k: int, json_mode: bool, summaries: bool = True,
+                       summary_only: bool = False) -> int:
     """Read a SOAP note and print its matching textbook references (with detailed summaries)."""
     note = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
     if not note.strip():
         print("Error: the SOAP note is empty.")
         return 2
-    res = PTQueryEngine(top_k=top_k).find_references(note, top_k=top_k, summaries=summaries)
+    res = PTQueryEngine(top_k=top_k).find_references(
+        note, top_k=top_k, summaries=summaries, summary_only=summary_only)
     print(json.dumps(res, indent=2, ensure_ascii=False) if json_mode else res["references"])
     return 0
 
@@ -175,13 +177,19 @@ def main():
     parser.add_argument("--json", "-j", action="store_true", help="Output response in JSON format")
     parser.add_argument("--soap-file", "-s", metavar="PATH",
                         help="SOAP note text file ('-' reads stdin); prints the matching textbook references")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="With --soap-file: print only each citation line and its Detailed Summary "
+                             "(no original sentences)")
     parser.add_argument("--no-summary", action="store_true",
                         help="With --soap-file: print only the citations and original sentences, without Detailed Summary")
 
     args = parser.parse_args()
 
     if args.soap_file:
-        return run_reference_mode(args.soap_file, args.top_k, args.json, summaries=not args.no_summary)
+        if args.summary_only and args.no_summary:
+            parser.error("--summary-only and --no-summary cannot be used together")
+        return run_reference_mode(args.soap_file, args.top_k, args.json,
+                                  summaries=not args.no_summary, summary_only=args.summary_only)
 
     if args.check_api:
         check_api_connectivity()

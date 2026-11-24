@@ -335,6 +335,32 @@ class DetailedSummary(unittest.TestCase):
             self.assertIn(f"({n}) {s}", summary_call["user_prompt"])
         self.assertEqual(summary_call["temperature"], 0.0)
 
+    def test_summary_only_shows_just_the_citation_and_the_summary(self):
+        engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1, 2",
+                                  summary_reply=f"{GOOD_SUMMARY} [1, 2]")
+        out = engine.find_references(RIGHT_KNEE_NOTE, summary_only=True)       # implies summaries
+        self.assertEqual(out["references"], "\n".join([HEAD, "Detailed Summary:", GOOD_SUMMARY]))
+        self.assertNotIn("Original Sentences", out["references"])
+        self.assertNotIn(S1, out["references"])
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(out["reference_entries"][0]["sentences"], [S1, S2])   # the JSON still has them
+
+    def test_summary_only_leaves_out_citations_without_a_supported_summary(self):
+        a = hit("a1", PF_TEXT, book_title="Book A", section_path="Ch 1 > Knee")
+        b = hit("b1", OA_TEXT, book_id="oa", book_title="OA Book", author=None, section_path="Ch 2 > Hip",
+                page_start="9", page_end="9")
+        engine, _ = make_engine(lambda p: [a, b], "Source 1: 1, 2\nSource 2: 1",
+                                summary_reply=f"{GOOD_SUMMARY} [1, 2]")        # fits Book A only
+        out = engine.find_references(RIGHT_KNEE_NOTE, summary_only=True)
+        self.assertEqual(out["references"].split("\n")[0], "1. Book A — A. Author, Chapter: Ch 1, Section: Knee, pp. 687–758")
+        self.assertNotIn("OA Book", out["references"])
+        self.assertEqual(len(out["reference_entries"]), 2)                     # still in the JSON
+        engine2, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1", summary_reply="INSUFFICIENT")
+        self.assertEqual(engine2.find_references(RIGHT_KNEE_NOTE, summary_only=True)["references"],
+                         "No supported summary was available for the retrieved references.")
+        engine3, _ = make_engine(lambda p: [], "unused")
+        self.assertEqual(engine3.find_references(RIGHT_KNEE_NOTE, summary_only=True)["references"], NO_REFERENCE_TEXT)
+
     def test_summary_is_off_by_default_in_the_engine(self):
         engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1, 2", summary_reply="x")
         out = engine.find_references(RIGHT_KNEE_NOTE)
