@@ -31,6 +31,7 @@ from config import (
 )
 from llm_client import LLMClient, get_llm_client
 from prompts import (
+    MAX_SENTENCES_PER_SOURCE,
     SYSTEM_PROMPT,
     REFERENCE_SYSTEM_PROMPT,
     NO_REFERENCE_TEXT,
@@ -365,9 +366,10 @@ class PTQueryEngine:
         hits = self.retrieve_for_note(sections, top_k=top_k, max_sources=max_sources)
         retrieval_ms = (time.time() - t0) * 1000
 
-        # Only complete sentences are offered, so only complete sentences can be printed.
-        numbered = [(h, [s for s in sentences_for(hit_text(h)) if s.complete]) for h in hits]
-        numbered = [(h, s) for h, s in numbered if s]          # passages with no complete sentence
+        # Only usable sentences are offered (complete, no glued heading, not a
+        # question, not a run-on), so only those can be printed.
+        numbered = [(h, [s for s in sentences_for(hit_text(h)) if s.usable]) for h in hits]
+        numbered = [(h, s) for h, s in numbered if s]          # passages with no usable sentence
         hits = [h for h, _ in numbered]
         sentences = [s for _, s in numbered]
 
@@ -383,7 +385,8 @@ class PTQueryEngine:
             raw_answer = gen.get("text", "")
             model = gen.get("model", model)
 
-        picks = extract_source_sentences(raw_answer, [len(s) for s in sentences])
+        picks = extract_source_sentences(
+            raw_answer, [len(s) for s in sentences], max_per_source=MAX_SENTENCES_PER_SOURCE)
         entries = build_reference_entries(hits, sentences, picks)
         shown = sorted({i for e in entries for i in e["sources"]})
         return {

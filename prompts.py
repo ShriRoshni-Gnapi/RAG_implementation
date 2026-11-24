@@ -145,6 +145,11 @@ Output only a combined list of relevant textbook references."""
 
 NO_REFERENCE_TEXT = "No matching reference was found."
 
+# At most this many sentences are printed per source. The model is asked to stay
+# within it and extract_source_sentences enforces it. Raise it if a real run
+# shows good sentences being left out.
+MAX_SENTENCES_PER_SOURCE = 3
+
 
 def assemble_numbered_context(hits: List[Dict[str, Any]], sentences: List[List[Any]]) -> str:
     """
@@ -178,6 +183,8 @@ SOAP NOTE:
 {soap_note}
 
 Return the combined list of relevant references. Write one line per reference: the source label exactly as written above, then the numbers of that source's sentences that directly support a finding in the note, separated by commas (for example "Source 3: 2, 4"). Write only the label and the numbers: no book details and no other words.
-Be strict. Include a source only if its sentences are about the same condition, body region and kind of finding as the note. Leave out a source that merely shares a term (for example "stairs", "swelling" or "pain") but describes a different condition, patient group or procedure. A short list is better than a long one. If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
+Be strict. Include a source only if its sentences are about the same condition, body region and kind of finding as the note. Leave out a source that merely shares a term (for example "stairs", "swelling" or "pain") but describes a different condition, patient group or procedure. A short list is better than a long one.
+Pick at most {MAX_SENTENCES_PER_SOURCE} sentences per source, most relevant first. Do not pick a sentence that: gives advice on treatment or management; states a general fact not tied to a finding in the note (for example norms for sex or age); or only makes sense after the sentence before it (it begins with "This", "These", "It" or "However"). Each picked sentence must support a finding by itself.
+If none of the passages is relevant, reply only: {NO_REFERENCE_TEXT}"""
 
 

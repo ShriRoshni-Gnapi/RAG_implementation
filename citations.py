@@ -151,7 +151,11 @@ def render_citation_entry(hit: Dict[str, Any], index: Optional[int] = None) -> D
     }
 
 
-def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int, List[int]]:
+def extract_source_sentences(
+    text: str,
+    sentence_counts: List[int],
+    max_per_source: Optional[int] = None,
+) -> Dict[int, List[int]]:
     """
     Reference mode: {source number: picked sentence numbers} from the model's
     reply ("Source 3: 2, 4").
@@ -159,7 +163,9 @@ def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int,
     Every source and sentence number is checked against what was actually
     shown, so an id the model made up can never reach the printed list. Ranges
     such as "2-4" are expanded. A source named with no valid sentence number
-    maps to [] and the caller drops it: nothing is shown for it.
+    maps to [] and the caller drops it: nothing is shown for it. With
+    max_per_source, the first valid picks in the model's own order are kept
+    (it lists the most relevant first) and returned in book order.
     """
     parts = re.split(r"Source\s*(\d+)", text or "", flags=re.I)
     out: Dict[int, List[int]] = {}
@@ -167,13 +173,14 @@ def extract_source_sentences(text: str, sentence_counts: List[int]) -> Dict[int,
         idx = int(num)
         if not (1 <= idx <= len(sentence_counts)) or idx in out:
             continue
-        picked: Set[int] = set()
+        ordered: List[int] = []                      # in the order the model wrote them
         for lo, hi, single in re.findall(r"(\d+)\s*[-–]\s*(\d+)|(\d+)", body):
             if single:
-                picked.add(int(single))
+                ordered.append(int(single))
             elif int(lo) <= int(hi) <= int(lo) + 50:
-                picked.update(range(int(lo), int(hi) + 1))
-        out[idx] = sorted(k for k in picked if 1 <= k <= sentence_counts[idx - 1])
+                ordered.extend(range(int(lo), int(hi) + 1))
+        valid = [k for k in dict.fromkeys(ordered) if 1 <= k <= sentence_counts[idx - 1]]
+        out[idx] = sorted(valid[:max_per_source] if max_per_source else valid)
     return out
 
 

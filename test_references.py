@@ -298,6 +298,91 @@ class OutputFormat(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Noise filters: questions, glued headings, run-ons, and the per-source cap
+# --------------------------------------------------------------------------
+
+# Sentences from a real run on the right-knee note (book text only, no patient data).
+RUN_ON = ("Pain or poor knee control when descending or ascending stairs Pain with walking, jumping, or running "
+          "interfering during ADL, instrumental ADL (IADL), work, and community, recreational, or sport activities "
+          "Pain and stiffness with prolonged flexed knee postures, such as sitting or squatting Patellofemoral "
+          "Symptoms: Management—Protection Phase When symptoms are acute, treat them as any acute joint problem—with "
+          "modalities, rest, gentle motion, and muscle-setting exercises in pain-free positions.")
+GLUED_HEADING = ("CHAPTER FIVE The Knee 241 Patellofemoral Disorders REHABILITATION RATIONALE Patellofemoral "
+                 "dysfunction, or disorder, may be defined as pain, imbalance, inflammation, and/or instability of "
+                 "any component of the extensor mechanism of the knee.")
+QUESTIONS = ["Is the pain worse in the morning when the patient gets out of bed and does it abate during the day, "
+             "or is it worse after prolonged ambulation or is it weather related?",
+             "Does the knee pain affect activities of daily living and the quality of life?",
+             "On a scale of a to 10, with the worst pain they have ever experienced being a 10, what does their "
+             "daily pain rate?"]
+KEPT = ["Pain and joint effusion inhibit the quadriceps, so it is imperative to reduce irritating forces.",
+        "These include treatment modalities that have im proved the pain (e.g., physical therapy, cortisone in "
+        "jections, medications, and splinting or bracing) as well as what makes the symptoms worse (e.g., walk "
+        "ing, running, athletic activity, stair climbing, or job activities).",
+        "PFJRFs (Fig. 4-44) increase with flexion of the knee from 0.5 times body weight during level walking to "
+        "3 to 4 times body weight during stairclimbing to 7 to 8 times body weight with squatting.",
+        "Etiology of Symptoms The cause of anterior knee pain may be direct trauma, overuse, faulty patellar "
+        "tracking from malalignment due to anatomical variations or soft tissue length and strength imbalances, "
+        "degeneration, or a combination of these factors.",
+        "However, critical review of available studies found no evidence that Q-angle measures correlated with "
+        "the presence or severity of anterior knee pain."]
+
+
+def usable(text):
+    return all(s.usable for s in sentences_for(text))
+
+
+class NoiseFilters(unittest.TestCase):
+
+    def test_questions_are_not_usable_or_offered(self):
+        for q in QUESTIONS:
+            self.assertFalse(usable(q), q)
+        text = f"{QUESTIONS[1]} {S2} What is the pain rating?"
+        engine, llm = make_engine(lambda p: [hit("a1", text)], "Source 1: 1")
+        ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
+        self.assertEqual(ref.split("\n")[1:], [f'"{S2}"'])
+        self.assertNotIn("quality of life", llm.calls[0]["user_prompt"])
+        self.assertNotIn("pain rating", llm.calls[0]["user_prompt"])
+
+    def test_glued_chapter_heading_is_not_usable(self):
+        self.assertFalse(usable(GLUED_HEADING))
+        self.assertFalse(usable("The ANTERIOR CRUCIATE LIGAMENT is a major stabiliser."))
+        self.assertTrue(usable("The ACL and PCL are major stabilisers of the knee joint."))   # short acronyms are fine
+        self.assertTrue(usable("Pain was rated on the VAS and the ADL scale during the first week."))
+
+    def test_run_on_sentences_are_not_usable(self):
+        self.assertFalse(usable(RUN_ON))
+        self.assertFalse(usable("Normal words flow on here. " * 1 + "word " * 90 + "end."))      # over 400 characters
+        self.assertTrue(usable("The patient reports pain on stairs and after sitting " + "with the knees bent " * 2 + "."))
+
+    def test_ordinary_long_and_proper_noun_sentences_are_kept(self):
+        for s in KEPT:
+            self.assertTrue(usable(s), s)
+
+    def test_real_run_filters_out_exactly_the_noise(self):
+        text = " ".join([RUN_ON, GLUED_HEADING, *QUESTIONS, *KEPT])
+        offered = [s.text for s in sentences_for(text) if s.usable]
+        self.assertEqual(offered, KEPT)
+
+    def test_at_most_three_sentences_per_source_in_the_models_own_order(self):
+        self.assertEqual(extract_source_sentences("Source 1: 4, 3, 2, 1", [5], max_per_source=3), {1: [2, 3, 4]})
+        self.assertEqual(extract_source_sentences("Source 1: 2-5, 1", [9], max_per_source=3), {1: [2, 3, 4]})
+        self.assertEqual(extract_source_sentences("Source 1: 4, 3, 2, 1", [5]), {1: [1, 2, 3, 4]})   # no cap by default
+        engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 4, 3, 2, 1")
+        ref = engine.find_references(RIGHT_KNEE_NOTE)["references"]
+        self.assertEqual(ref.split("\n")[1:], [f'"{S2}"', f'"{S3}"', f'"{S4}"'])      # most relevant three, book order
+        self.assertNotIn(S1, ref)
+
+    def test_prompt_tells_the_model_what_to_skip(self):
+        engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1")
+        engine.find_references(RIGHT_KNEE_NOTE)
+        prompt = llm.calls[0]["user_prompt"]
+        for phrase in ("at most 3 sentences per source", "advice on treatment or management",
+                       "not tied to a finding", "only makes sense after the sentence before it"):
+            self.assertIn(phrase, prompt)
+
+
+# --------------------------------------------------------------------------
 # Supporting behaviour
 # --------------------------------------------------------------------------
 

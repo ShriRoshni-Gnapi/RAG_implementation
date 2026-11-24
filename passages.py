@@ -22,10 +22,21 @@ class Sentence(NamedTuple):
     text: str
     cut_start: bool = False   # the sentence began before this passage / before a page break
     cut_end: bool = False     # the sentence continues after this passage / after a page break
+    heading: bool = False     # a chapter title or running head is glued into the text
 
     @property
     def complete(self) -> bool:
         return not (self.cut_start or self.cut_end)
+
+    @property
+    def usable(self) -> bool:
+        """
+        Safe to offer and print: complete, free of glued headings, not a
+        question (history-taking prompts in the books) and not a run-on that
+        merges list items or headings into one 'sentence'.
+        """
+        return (self.complete and not self.heading
+                and not _QUESTION.search(self.text) and not _is_run_on(self.text))
 
 
 def hit_text(hit: Dict[str, Any]) -> str:
@@ -58,6 +69,41 @@ def _mark_page_furniture(text: str) -> str:
 
     text = _NUMBER_THEN_HEAD.sub(drop, text)
     return _HEAD_THEN_NUMBER.sub(drop, text)
+
+
+# A long ALL-CAPS run or a "CHAPTER FIVE" start inside a sentence is a heading
+# that the extraction glued to the text ("CHAPTER FIVE The Knee 241 ...
+# REHABILITATION RATIONALE Patellofemoral dysfunction, or disorder, ...").
+_CAPS_RUN_ANY = re.compile(rf"(?:{_CAPS_TOKEN}(?:\s+|$)){{2,}}")
+_CHAPTER_START = re.compile(r"^(?:CHAPTER|PART|SECTION|APPENDIX)\s+\w+\b")
+
+
+def _has_heading(text: str) -> bool:
+    if _CHAPTER_START.match(text):
+        return True
+    return any(sum(c.isalpha() for c in m.group()) >= _MIN_HEAD_LETTERS
+               for m in _CAPS_RUN_ANY.finditer(text))
+
+
+# --------------------------------------------------------------------------
+# Questions and run-ons
+# --------------------------------------------------------------------------
+
+_QUESTION = re.compile(r"""\?["'”’)\]]*$""")
+
+# A real sentence is rarely longer than this. A run-on that merges list items
+# or headings also shows several lower-case word -> Capitalised word jumps
+# with no punctuation between them ("activities Pain", "squatting Patellofemoral").
+MAX_SENTENCE_CHARS = 400
+_RUN_ON_MIN_CHARS = 200
+_RUN_ON_JUMPS = 3
+_CASE_JUMP = re.compile(r"(?<=[a-z]) [A-Z][a-z]{2,}\b")
+
+
+def _is_run_on(text: str) -> bool:
+    if len(text) > MAX_SENTENCE_CHARS:
+        return True
+    return len(text) > _RUN_ON_MIN_CHARS and len(_CASE_JUMP.findall(text)) >= _RUN_ON_JUMPS
 
 
 # --------------------------------------------------------------------------
@@ -155,6 +201,7 @@ def sentences_for(text: str) -> List[Sentence]:
             text=strip_reference_numbers(f),
             cut_start=f[:1].islower() and (i == 0 or i in after_break),
             cut_end=(i == last or i in before_break) and not _TERMINAL.search(f),
+            heading=_has_heading(f),
         )
         for i, f in enumerate(frags)
     ]
