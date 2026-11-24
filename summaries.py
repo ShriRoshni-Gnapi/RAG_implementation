@@ -97,8 +97,10 @@ def parse_summary(reply: str, sentences: List[str]) -> Tuple[List[str], List[Dic
     `sentences` are the numbered passage sentences the model was shown.
     `rejected` lists each dropped paragraph with its reason, for debugging.
     """
-    if not (reply or "").strip() or reply.strip().upper().startswith(INSUFFICIENT_TEXT):
-        return [], []
+    if not (reply or "").strip():
+        return [], [{"paragraph": "", "reason": "empty reply from the model"}]
+    if reply.strip().upper().startswith(INSUFFICIENT_TEXT):
+        return [], [{"paragraph": "", "reason": "the model said the passage is insufficient"}]
 
     passage = " ".join(sentences)
     passage_words = {w.lower() for w in _WORD.findall(passage)}

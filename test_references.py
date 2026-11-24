@@ -346,6 +346,16 @@ class DetailedSummary(unittest.TestCase):
         out, _ = run_with_summary("INSUFFICIENT")
         self.assertEqual(out["references"], "\n".join([HEAD, "Original Sentences:", f'"{S1}"', f'"{S2}"']))
         self.assertEqual(out["reference_entries"][0]["summary"], [])
+        self.assertEqual(out["summary_notes"],
+                         [{"citation": 1, "paragraph": "", "reason": "the model said the passage is insufficient"}])
+        self.assertEqual(out["reference_entries"][0]["summary_raw"], "INSUFFICIENT")
+
+    def test_empty_summary_reply_is_explained_and_the_raw_reply_is_kept(self):
+        out, _ = run_with_summary("")
+        self.assertEqual(out["summary_notes"][0]["reason"], "empty reply from the model")
+        out, _ = run_with_summary(f"{GOOD_SUMMARY}")                    # model forgot the evidence numbers
+        self.assertEqual(out["summary_notes"][0]["reason"], "no sentence numbers at the end")
+        self.assertEqual(out["reference_entries"][0]["summary_raw"], GOOD_SUMMARY)
 
     def test_paragraph_without_valid_evidence_is_dropped(self):
         out, _ = run_with_summary(f"{GOOD_SUMMARY}\n{GOOD_SUMMARY} [99]\n{GOOD_SUMMARY} [0]")
@@ -405,8 +415,8 @@ class DetailedSummary(unittest.TestCase):
         for tag in ("[1, 2]", "[S1-S2]", "[1-2]", "[s2]"):
             kept, rejected = parse_summary(f"{GOOD_SUMMARY} {tag}", sents)
             self.assertEqual((kept, rejected), ([GOOD_SUMMARY], []), tag)
-        self.assertEqual(parse_summary("", sents), ([], []))
-        self.assertEqual(parse_summary("insufficient information here", sents), ([], []))
+        self.assertEqual(parse_summary("", sents)[0], [])
+        self.assertEqual(parse_summary("insufficient information here", sents)[0], [])
 
 
 # --------------------------------------------------------------------------

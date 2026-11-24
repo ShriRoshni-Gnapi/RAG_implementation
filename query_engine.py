@@ -355,9 +355,10 @@ class PTQueryEngine:
 
     def _summarize(self, entry: Dict[str, Any], passages: List[List[Any]]):
         """
-        (paragraphs, rejected) for one citation: the model sees the complete
-        retrieved passage(s) behind it, numbered, and every paragraph it
-        writes is checked against that text. A failed call gives no summary.
+        (paragraphs, rejected, raw reply) for one citation: the model sees the
+        complete retrieved passage(s) behind it, numbered, and every paragraph
+        it writes is checked against that text. A failed call gives no summary.
+        The raw reply is returned so a missing summary can be explained.
         """
         texts = [s.text for idx in entry["sources"] for s in passages[idx - 1]]
         numbered = "\n".join(f"({k}) {t}" for k, t in enumerate(texts, 1))
@@ -369,8 +370,9 @@ class PTQueryEngine:
                 max_tokens=SUMMARY_MAX_TOKENS,
             ).get("text", "")
         except LLMError as e:
-            return [], [{"paragraph": "", "reason": f"summary call failed: {type(e).__name__}"}]
-        return parse_summary(reply, texts)
+            return [], [{"paragraph": "", "reason": f"summary call failed: {type(e).__name__}"}], ""
+        paragraphs, rejected = parse_summary(reply, texts)
+        return paragraphs, rejected, reply
 
     def find_references(
         self,
@@ -430,7 +432,7 @@ class PTQueryEngine:
         summary_notes: List[Dict[str, Any]] = []
         if summaries:
             for n, entry in enumerate(entries, 1):
-                entry["summary"], notes = self._summarize(entry, passages)
+                entry["summary"], notes, entry["summary_raw"] = self._summarize(entry, passages)
                 summary_notes.extend({"citation": n, **note} for note in notes)
         return {
             "references": format_reference_list(entries, with_summary=summaries),
