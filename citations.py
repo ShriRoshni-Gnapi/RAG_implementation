@@ -302,18 +302,27 @@ def citation_line(number: int, entry: Dict[str, Any]) -> str:
     return f"{number}. {entry['book']}" + (f" — {', '.join(known)}" if known else "")
 
 
-def format_reference_list(entries: List[Dict[str, Any]]) -> str:
+def format_reference_list(entries: List[Dict[str, Any]], with_summary: bool = False) -> str:
     """
     Academic-style list: one citation line per entry, then each original
-    textbook sentence in quotation marks. Only complete stored sentences and
-    stored metadata appear; nothing is written by the model.
+    textbook sentence in quotation marks. The sentences and the metadata are
+    stored text.
+
+    With with_summary the sentences sit under 'Original Sentences:' and an
+    entry that has a checked summary gets a 'Detailed Summary:' section. That
+    section is the only model-written text; an entry without one shows none.
     """
     if not entries:
         return NO_REFERENCE_TEXT
     lines: List[str] = []
     for n, e in enumerate(entries, 1):
         lines.append(citation_line(n, e))
+        if with_summary:
+            lines.append("Original Sentences:")
         lines.extend(f'"{s}"' for s in e["sentences"])
+        if with_summary and e.get("summary"):
+            lines.append("Detailed Summary:")
+            lines.extend(e["summary"])
     return "\n".join(lines)
 
 

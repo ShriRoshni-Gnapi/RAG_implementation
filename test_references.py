@@ -32,8 +32,10 @@ from citations import (
     build_reference_entries, chapter_and_section, citation_line, extract_source_sentences,
     format_reference_list, page_text,
 )
+from llm_client import LLMError
 from passages import sentences_for, split_text
-from prompts import NO_REFERENCE_TEXT
+from prompts import NO_REFERENCE_TEXT, SUMMARY_SYSTEM_PROMPT
+from summaries import parse_summary
 
 RIGHT_KNEE_NOTE = """S: 54-year-old reports right knee pain for 3 weeks, worse going up and down stairs and after prolonged sitting with knees bent. Pain rated 6/10 at worst and 2/10 at rest. Reports occasional swelling after long walks and a feeling of the knee giving way on stairs. No history of trauma. Difficulty rising from a low chair.
 O: Observation: mild effusion over the right knee, no redness. Gait: antalgic with reduced stance time on the right. Palpation: tenderness along the medial and lateral patellar borders. Range of motion: right knee flexion 0-110 degrees, left 0-135 degrees; extension lacks 5 degrees on the right. Strength: quadriceps 4/5 right, 5/5 left; hip abductors 4/5 right. Patellar tracking: lateral deviation during active extension. Special tests: patellar grind test positive, Lachman test negative, McMurray test negative. Single-leg squat shows dynamic knee valgus.
@@ -58,19 +60,25 @@ def hit(chunk_id, text, score=0.6, **kw):
 
 
 class FakeLLM:
+    """Selection calls get `reply`; summary calls get `summary_reply` (or raise `summary_error`)."""
     model = "fake-llm"
 
-    def __init__(self, reply):
-        self.reply, self.calls = reply, []
+    def __init__(self, reply, summary_reply=None, summary_error=None):
+        self.reply, self.summary_reply, self.summary_error = reply, summary_reply, summary_error
+        self.calls = []
 
     def generate(self, **kw):
         self.calls.append(kw)
+        if kw.get("system_prompt") == SUMMARY_SYSTEM_PROMPT:
+            if self.summary_error:
+                raise self.summary_error
+            return {"text": self.summary_reply or "", "model": "fake-llm"}
         return {"text": self.reply, "model": "fake-llm"}
 
 
-def make_engine(results_for, reply):
+def make_engine(results_for, reply, **llm_kw):
     """Engine whose search returns results_for(piece) and whose model returns reply."""
-    llm = FakeLLM(reply)
+    llm = FakeLLM(reply, **llm_kw)
     engine = qe.PTQueryEngine(client=llm)
     engine.queries = []
 
@@ -295,6 +303,110 @@ class OutputFormat(unittest.TestCase):
         self.assertEqual(page_text(hit("a", "x", page_start="687", page_end="758")), "pp. 687–758")
         self.assertEqual(page_text(hit("a", "x", page_start="7", page_end=None)), "p. 7")
         self.assertIsNone(page_text(hit("a", "x", page_start=None, page_end=None)))
+
+
+# --------------------------------------------------------------------------
+# Detailed summary (the only model-written text, held to the passage)
+# --------------------------------------------------------------------------
+
+GOOD_SUMMARY = ("The passage links patellofemoral pain to stair use and notes that weakness of the hip "
+                "abductor muscles is common in these patients.")
+HEAD = "1. Book A — A. Author, Chapter: Chapter 21: The Knee, pp. 687–758"
+
+
+def run_with_summary(summary_reply, text=PF_TEXT, **llm_kw):
+    engine, llm = make_engine(lambda p: [hit("a1", text)], "Source 1: 1, 2",
+                              summary_reply=summary_reply, **llm_kw)
+    return engine.find_references(RIGHT_KNEE_NOTE, summaries=True), llm
+
+
+class DetailedSummary(unittest.TestCase):
+
+    def test_expected_layout(self):
+        out, llm = run_with_summary(f"{GOOD_SUMMARY} [1, 2]")
+        self.assertEqual(out["references"], "\n".join([
+            HEAD, "Original Sentences:", f'"{S1}"', f'"{S2}"', "Detailed Summary:", GOOD_SUMMARY]))
+        self.assertEqual(out["reference_entries"][0]["summary"], [GOOD_SUMMARY])
+        self.assertEqual(out["summary_notes"], [])
+        # the model saw the COMPLETE passage (all four sentences, not only the two quoted)
+        summary_call = llm.calls[1]
+        self.assertEqual(summary_call["system_prompt"], SUMMARY_SYSTEM_PROMPT)
+        for n, s in enumerate((S1, S2, S3, S4), 1):
+            self.assertIn(f"({n}) {s}", summary_call["user_prompt"])
+        self.assertEqual(summary_call["temperature"], 0.0)
+
+    def test_summary_is_off_by_default_in_the_engine(self):
+        engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], "Source 1: 1, 2", summary_reply="x")
+        out = engine.find_references(RIGHT_KNEE_NOTE)
+        self.assertEqual(len(llm.calls), 1)                       # selection only
+        self.assertNotIn("Detailed Summary", out["references"])
+        self.assertNotIn("Original Sentences", out["references"])
+
+    def test_insufficient_passage_gets_no_summary_section(self):
+        out, _ = run_with_summary("INSUFFICIENT")
+        self.assertEqual(out["references"], "\n".join([HEAD, "Original Sentences:", f'"{S1}"', f'"{S2}"']))
+        self.assertEqual(out["reference_entries"][0]["summary"], [])
+
+    def test_paragraph_without_valid_evidence_is_dropped(self):
+        out, _ = run_with_summary(f"{GOOD_SUMMARY}\n{GOOD_SUMMARY} [99]\n{GOOD_SUMMARY} [0]")
+        self.assertNotIn("Detailed Summary", out["references"])
+        self.assertEqual([n["reason"] for n in out["summary_notes"]],
+                         ["no sentence numbers at the end", "no valid sentence numbers", "no valid sentence numbers"])
+
+    def test_invented_number_or_name_is_dropped(self):
+        for bad, reason in (
+            ("The passage says pain rises by 40 percent on stairs in these patients [1]", "number not in the passage: 40"),
+            ("The passage ties patellofemoral pain on stairs to the work of Virchow in these patients [1]",
+             "name or term not in the passage: Virchow"),
+            ("The passage ties patellofemoral pain on stairs to the ACL in these patients [1]",
+             "name or term not in the passage: ACL"),
+        ):
+            out, _ = run_with_summary(bad)
+            self.assertNotIn("Detailed Summary", out["references"], bad)
+            self.assertEqual(out["summary_notes"][0]["reason"], reason)
+
+    def test_copied_sentence_and_unsupported_topic_are_dropped(self):
+        copy = f"{S1} This matches what clinicians usually see in practice [1]"
+        off_topic = "The author describes how regular swimming improves cardiovascular fitness and endurance [1]"
+        out, _ = run_with_summary(f"{copy}\n{off_topic}")
+        self.assertNotIn("Detailed Summary", out["references"])
+        self.assertEqual([n["reason"] for n in out["summary_notes"]],
+                         ["copies an original sentence", "not supported by the sentences it cites"])
+
+    def test_only_supported_paragraphs_are_printed_and_tags_are_removed(self):
+        bad = "The passage says pain rises by 40 percent on stairs in these patients [1]"
+        out, _ = run_with_summary(f"{bad}\n- {GOOD_SUMMARY} [S1-S2]")
+        self.assertEqual(out["reference_entries"][0]["summary"], [GOOD_SUMMARY])
+        self.assertNotIn("[", out["references"])
+        self.assertNotIn("40", out["references"])
+
+    def test_failed_summary_call_still_prints_the_citation(self):
+        out, _ = run_with_summary(None, summary_error=LLMError("server down"))
+        self.assertEqual(out["references"], "\n".join([HEAD, "Original Sentences:", f'"{S1}"', f'"{S2}"']))
+        self.assertEqual(out["summary_notes"][0]["reason"], "summary call failed: LLMError")
+
+    def test_one_summary_covers_every_passage_of_a_citation(self):
+        a = hit("bk_00001", PF_TEXT, section_path="Ch 5 > Knee", page_start="10", page_end="20")
+        b = hit("bk_00002", "Rest helps in the acute stage. Ice may ease swelling.", section_path="Ch 5 > Knee",
+                page_start="10", page_end="20")
+        engine, llm = make_engine(lambda p: [a, b], "Source 1: 1\nSource 2: 1",
+                                  summary_reply="The text lists rest in the acute stage as one point [5]")
+        out = engine.find_references(RIGHT_KNEE_NOTE, summaries=True)
+        self.assertEqual(len(out["reference_entries"]), 1)         # same book, chapter, section, pages
+        self.assertEqual(out["reference_entries"][0]["summary"],
+                         ["The text lists rest in the acute stage as one point"])   # evidence [5] is in the 2nd passage
+        prompt = llm.calls[1]["user_prompt"]
+        self.assertIn("(4) Check foot posture.", prompt)
+        self.assertIn("(5) Rest helps in the acute stage.", prompt)  # numbering continues across passages
+        self.assertEqual(len(llm.calls), 2)                        # one summary call per citation
+
+    def test_parse_summary_evidence_formats(self):
+        sents = [S1, S2, S3, S4]
+        for tag in ("[1, 2]", "[S1-S2]", "[1-2]", "[s2]"):
+            kept, rejected = parse_summary(f"{GOOD_SUMMARY} {tag}", sents)
+            self.assertEqual((kept, rejected), ([GOOD_SUMMARY], []), tag)
+        self.assertEqual(parse_summary("", sents), ([], []))
+        self.assertEqual(parse_summary("insufficient information here", sents), ([], []))
 
 
 # --------------------------------------------------------------------------

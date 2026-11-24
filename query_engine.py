@@ -29,9 +29,12 @@ from config import (
     get_llm_config,
     get_qdrant_config,
 )
-from llm_client import LLMClient, get_llm_client
+from llm_client import LLMClient, LLMError, get_llm_client
+from summaries import parse_summary
 from prompts import (
     MAX_SENTENCES_PER_SOURCE,
+    SUMMARY_SYSTEM_PROMPT,
+    build_summary_user_prompt,
     SYSTEM_PROMPT,
     REFERENCE_SYSTEM_PROMPT,
     NO_REFERENCE_TEXT,
@@ -67,6 +70,10 @@ def get_embedding_model():
 # stays under that (config.py measured up to 0.42 tokens/char).
 NOTE_SEGMENT_CHARS = 500
 
+
+# Room for two to four short summary paragraphs, plus any thinking text the
+# server's model emits before them.
+SUMMARY_MAX_TOKENS = 1500
 
 # "S:", "O:", "A:", "P:" or "Subjective:" ... at the start of a line.
 _SECTION_MARK = re.compile(
@@ -346,19 +353,44 @@ class PTQueryEngine:
         ranked = fuse_ranked_hits(results, weights)
         return [h for h in ranked if h["score"] >= self.min_score][:max_sources]
 
+    def _summarize(self, entry: Dict[str, Any], passages: List[List[Any]]):
+        """
+        (paragraphs, rejected) for one citation: the model sees the complete
+        retrieved passage(s) behind it, numbered, and every paragraph it
+        writes is checked against that text. A failed call gives no summary.
+        """
+        texts = [s.text for idx in entry["sources"] for s in passages[idx - 1]]
+        numbered = "\n".join(f"({k}) {t}" for k, t in enumerate(texts, 1))
+        try:
+            reply = self.client.generate(
+                system_prompt=SUMMARY_SYSTEM_PROMPT,
+                user_prompt=build_summary_user_prompt(numbered),
+                temperature=0.0,
+                max_tokens=SUMMARY_MAX_TOKENS,
+            ).get("text", "")
+        except LLMError as e:
+            return [], [{"paragraph": "", "reason": f"summary call failed: {type(e).__name__}"}]
+        return parse_summary(reply, texts)
+
     def find_references(
         self,
         soap_note: str,
         top_k: Optional[int] = None,
         max_sources: int = 12,
+        summaries: bool = False,
     ) -> Dict[str, Any]:
         """
         SOAP note -> combined list of relevant textbook references.
 
         Extractive: the model only picks which numbered sentences of which
-        retrieved passages are relevant. Everything printed (book details and
-        excerpt sentences) is stored text, so nothing from outside the books
-        and no invented title, author, chapter or page can appear.
+        retrieved passages are relevant. The book details and the quoted
+        sentences are stored text, so nothing from outside the books and no
+        invented title, author, chapter or page can appear.
+
+        With summaries=True each citation also gets a 'Detailed Summary' of
+        its passage. That is the only model-written text; it is checked
+        against the passage (see summaries.py) and left out when it cannot be
+        supported.
         """
         t0 = time.time()
         # Plan text is not used: the task reads S, O and A and gives no treatment.
@@ -367,11 +399,17 @@ class PTQueryEngine:
         retrieval_ms = (time.time() - t0) * 1000
 
         # Only usable sentences are offered (complete, no glued heading, not a
-        # question, not a run-on), so only those can be printed.
-        numbered = [(h, [s for s in sentences_for(hit_text(h)) if s.usable]) for h in hits]
-        numbered = [(h, s) for h, s in numbered if s]          # passages with no usable sentence
-        hits = [h for h, _ in numbered]
-        sentences = [s for _, s in numbered]
+        # question, not a run-on), so only those can be printed. The whole
+        # passage is kept for the summary.
+        rows = []
+        for h in hits:
+            whole = sentences_for(hit_text(h))
+            usable = [s for s in whole if s.usable]
+            if usable:                                         # passages with no usable sentence are dropped
+                rows.append((h, usable, whole))
+        hits = [h for h, _, _ in rows]
+        sentences = [s for _, s, _ in rows]
+        passages = [w for _, _, w in rows]
 
         raw_answer, model = "", self.client.model
         if hits:
@@ -389,8 +427,14 @@ class PTQueryEngine:
             raw_answer, [len(s) for s in sentences], max_per_source=MAX_SENTENCES_PER_SOURCE)
         entries = build_reference_entries(hits, sentences, picks)
         shown = sorted({i for e in entries for i in e["sources"]})
+        summary_notes: List[Dict[str, Any]] = []
+        if summaries:
+            for n, entry in enumerate(entries, 1):
+                entry["summary"], notes = self._summarize(entry, passages)
+                summary_notes.extend({"citation": n, **note} for note in notes)
         return {
-            "references": format_reference_list(entries),
+            "references": format_reference_list(entries, with_summary=summaries),
+            "summary_notes": summary_notes,
             "source_indices": sorted(i for i, p in picks.items() if p),
             "dropped_sources": sorted(i for i, p in picks.items() if not p),
             "reference_entries": entries,

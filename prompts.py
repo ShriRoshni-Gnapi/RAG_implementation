@@ -165,6 +165,44 @@ def assemble_numbered_context(hits: List[Dict[str, Any]], sentences: List[List[A
     return "\n\n".join(blocks)
 
 
+# --------------------------------------------------------------------------
+# Detailed summary of a cited passage
+# --------------------------------------------------------------------------
+
+INSUFFICIENT_TEXT = "INSUFFICIENT"
+
+SUMMARY_SYSTEM_PROMPT = """You explain physiotherapy textbook passages.
+Write a detailed summary of the retrieved passage you are given, using only that passage.
+
+1. Read the complete passage before writing.
+2. Explain the main concept and the important supporting points.
+3. Describe the clinical or technical meaning of the passage in clear, simple language.
+4. Explain terminology only where the passage itself explains it.
+5. Explain how the different points in the passage are connected.
+6. Preserve the author's intended meaning.
+7. Do not use general medical knowledge, other books, assumptions or anything the passage does not state.
+8. Do not copy the original sentences; explain them in your own words.
+9. Write a well-structured explanation of two to four short paragraphs, not a one-line summary.
+10. If the passage does not give enough information to explain a point, leave that point out. Never guess."""
+
+
+def build_summary_user_prompt(numbered_passage: str) -> str:
+    """
+    User message for the detailed summary of one citation's passage(s).
+
+    The model must end every paragraph with the numbers of the passage
+    sentences it is based on. The caller checks those numbers and the
+    paragraph against the passage and drops any paragraph it cannot support;
+    the numbers themselves are never printed.
+    """
+    return f"""RETRIEVED PASSAGE (every sentence is numbered):
+═════════════════════════════════════════════════════════════
+{numbered_passage}
+═════════════════════════════════════════════════════════════
+
+Write the detailed summary now. Put each paragraph on its own line and end it with the numbers of the passage sentences it is based on, in square brackets, for example [2, 5]. Every paragraph must end with such numbers. Use only facts and terms that appear in the passage, and no headings, bullet points or other text. If the passage does not contain enough information for a meaningful summary, reply only: {INSUFFICIENT_TEXT}"""
+
+
 def build_reference_user_prompt(soap_note: str, context_text: str) -> str:
     """
     User message for reference mode: the numbered passages plus the SOAP note.
