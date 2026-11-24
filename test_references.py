@@ -11,11 +11,15 @@ right sentences or that the real Qdrant data ranks well; only the live check
 (which needs Qdrant, the embedding model and the LLM server) can show that.
 """
 
+import contextlib
+import io
+import json
 import os
 import re
 import sys
 import types
 import unittest
+from unittest import mock
 
 try:                                    # unit tests need no Qdrant server
     import qdrant_client  # noqa: F401
@@ -27,10 +31,11 @@ except ImportError:
             setattr(_m, _a, object)
         sys.modules[_name] = _m
 
+import ask
 import query_engine as qe
 from citations import (
     build_reference_entries, chapter_and_section, citation_line, extract_source_sentences,
-    format_reference_list, page_text,
+    format_reference_list, page_text, selection_reply_usable,
 )
 from llm_client import LLMError
 from passages import sentences_for, split_text
@@ -557,6 +562,112 @@ class DetailedSummary(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Failed or unusable model replies are failures, never "no references"
+# --------------------------------------------------------------------------
+
+SOURCE_LIST_FAILURE = "the model's source list could not be read"
+
+
+def find(selection, summary="x", **llm_kw):
+    engine, llm = make_engine(lambda p: [hit("a1", PF_TEXT)], selection, summary_reply=summary, **llm_kw)
+    return engine.find_references(RIGHT_KNEE_NOTE, summaries=True, summary_only=True), llm
+
+
+class FailedReplies(unittest.TestCase):
+
+    def test_a_source_list_that_cannot_be_read_is_a_failure(self):
+        for reply in ("Sure! Here are some thoughts about the note.", "", "   ", "I cannot help with that."):
+            out, llm = find(reply)
+            self.assertEqual(out["failures"], [SOURCE_LIST_FAILURE], repr(reply))
+            self.assertEqual(out["reference_entries"], [])
+            self.assertEqual(len(llm.calls), 1)                    # no summaries are asked for
+
+    def test_no_match_and_unnamed_sources_are_real_answers_not_failures(self):
+        for reply in (NO_REFERENCE_TEXT, NO_REFERENCE_TEXT.lower(), "Source 1: none", "Source 1: 99"):
+            out, _ = find(reply)
+            self.assertEqual(out["failures"], [], reply)
+
+    def test_nothing_retrieved_is_not_a_failure(self):
+        engine, llm = make_engine(lambda p: [], "unused")
+        out = engine.find_references(RIGHT_KNEE_NOTE, summaries=True, summary_only=True)
+        self.assertEqual((out["failures"], llm.calls), ([], []))
+
+    def test_an_empty_summary_reply_is_a_failure(self):
+        out, _ = find("Source 1: 1, 2", "")
+        self.assertEqual(out["failures"], ["citation 1: empty reply"])
+
+    def test_a_summary_without_any_sentence_numbers_is_a_failure(self):
+        out, _ = find("Source 1: 1, 2", GOOD_SUMMARY)                # the model ignored the format
+        self.assertEqual(out["failures"], ["citation 1: reply without sentence numbers"])
+        out, _ = find("Source 1: 1, 2", f"{GOOD_SUMMARY} [99]")      # numbers that do not exist
+        self.assertEqual(out["failures"], ["citation 1: reply without sentence numbers"])
+
+    def test_a_failed_summary_call_is_a_failure(self):
+        out, _ = find("Source 1: 1, 2", summary_error=LLMError("down"))
+        self.assertEqual(out["failures"], ["citation 1: call failed"])
+
+    def test_insufficient_and_checked_out_summaries_are_real_answers_not_failures(self):
+        out, _ = find("Source 1: 1, 2", "INSUFFICIENT")
+        self.assertEqual(out["failures"], [])
+        out, _ = find("Source 1: 1, 2", "The pain rises by 40 percent on stairs in these patients [1].")
+        self.assertEqual(out["failures"], [])                         # rejected by the checks: a quality result
+        self.assertEqual(out["summary_notes"][0]["reason"], "number not in the passage: 40")
+        out, _ = find("Source 1: 1, 2", f"{GOOD_SUMMARY} [1, 2]\nA second line without numbers that is long enough")
+        self.assertEqual(out["failures"], [])                         # one usable paragraph is enough
+
+    def test_only_the_failed_citation_is_named(self):
+        a = hit("a1", PF_TEXT, section_path="Ch 1 > Knee")
+        b = hit("b1", OA_TEXT, book_id="oa", book_title="OA Book", section_path="Ch 2 > Hip")
+        engine, llm = make_engine(lambda p: [a, b], "Source 1: 1, 2\nSource 2: 1",
+                                  summary_reply="")                    # every summary reply is empty
+        out = engine.find_references(RIGHT_KNEE_NOTE, summaries=True, summary_only=True)
+        self.assertEqual(out["failures"], ["citation 1: empty reply", "citation 2: empty reply"])
+
+    def test_failure_reasons_never_contain_note_text(self):
+        out, _ = find("Sure! here is some chat", "")
+        self.assertNotIn("stairs", " ".join(out["failures"]))
+
+    def test_selection_reply_usable(self):
+        for text in ("Source 3: 2, 4", "source 1: 1", f"Reply: {NO_REFERENCE_TEXT}"):
+            self.assertTrue(selection_reply_usable(text), text)
+        for text in ("", None, "The source of the pain is the knee.", "Sources are listed below."):
+            self.assertFalse(selection_reply_usable(text), repr(text))
+
+
+class CliFailureHandling(unittest.TestCase):
+
+    def run_cli(self, selection, summary="x", json_mode=False):
+        engine, _ = make_engine(lambda p: [hit("a1", PF_TEXT)], selection, summary_reply=summary)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(ask, "PTQueryEngine", return_value=engine), \
+                mock.patch("sys.stdin", io.StringIO(RIGHT_KNEE_NOTE)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = ask.run_reference_mode("-", 5, json_mode)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_failed_lookup_is_not_reported_as_no_match(self):
+        code, out, err = self.run_cli("Sure! chat")
+        self.assertEqual((code, out), (1, ""))
+        self.assertNotIn(NO_REFERENCE_TEXT, out + err)
+        self.assertIn(f"Incomplete result, the model's reply could not be used: {SOURCE_LIST_FAILURE}", err)
+
+    def test_a_real_no_match_still_prints_and_succeeds(self):
+        code, out, err = self.run_cli(NO_REFERENCE_TEXT)
+        self.assertEqual((code, out.strip(), err), (0, NO_REFERENCE_TEXT, ""))
+
+    def test_json_output_carries_the_failures_and_the_failing_exit_code(self):
+        code, out, err = self.run_cli("Source 1: 1, 2", "", json_mode=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["failures"], ["citation 1: empty reply"])
+        self.assertIn("citation 1: empty reply", err)
+
+    def test_a_good_run_exits_zero(self):
+        code, out, err = self.run_cli("Source 1: 1, 2", f"{GOOD_SUMMARY} [1, 2]")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Detailed Summary:", out)
+
+
+# --------------------------------------------------------------------------
 # Noise filters: questions, glued headings, run-ons, and the per-source cap
 # --------------------------------------------------------------------------
 
@@ -578,7 +689,14 @@ KEPT = ["Pain and joint effusion inhibit the quadriceps, so it is imperative to 
         "PFJRFs (Fig. 4-44) increase with flexion of the knee from 0.5 times body weight during level walking to "
         "3 to 4 times body weight during stairclimbing to 7 to 8 times body weight with squatting.",
         "The McConnell Test is positive when pain is felt during the step down and the patient cannot control it.",
-        "Anterior Cruciate Ligament injuries are common in sports that need cutting and landing."]
+        "Anterior Cruciate Ligament injuries are common in sports that need cutting and landing.",
+        # valid sentences an earlier version of the filters dropped
+        "The ACL PCL MCL LCL complex stabilises the knee joint in all planes.",
+        "The ACL, PCL, MCL, LCL are the four main ligaments of the knee joint.",
+        "This test is performed with the patient supine and the knee flexed to 90 degrees.",
+        "It is important to measure both sides so that the findings can be compared.",
+        "Magee Orthopedic Physical Assessment describes the test in detail for each joint.",
+        "Anterior Cruciate Ligament Injury Prevention Programs reduce injury rates in athletes."]
 # Glued Title Case headings, and sentences that lean on the sentence before them.
 TITLE_HEADINGS = [
     "Etiology of Symptoms The cause of anterior knee pain may be direct trauma, overuse, faulty patellar tracking "
@@ -591,7 +709,9 @@ DEPENDENT = [
     "presence or severity of anterior knee pain.",
     "These include treatment modalities that have improved the pain as well as what makes the symptoms worse.",
     "This signals lateral patellar instability.",
-    "It is imperative to reduce irritating forces when the joint is swollen and painful."]
+    "These tests are used to find the cause of pain in the front of the knee.",
+    "This process ensures that treatment can be tailored to the person.",
+    "It is performed with the patient supine and the knee flexed to 90 degrees."]
 
 
 def usable(text):
@@ -633,6 +753,41 @@ class NoiseFilters(unittest.TestCase):
         for s in DEPENDENT:
             self.assertFalse(usable(s), s)
         self.assertTrue(usable("Items that follow it are fine, and so is this sentence about the Italian study."))
+
+    def test_acronym_lists_are_text_not_headings_or_page_furniture(self):
+        # four 3-letter acronyms reach 12 letters, but a running head also has a long word
+        self.assertTrue(usable("The ACL PCL MCL LCL complex stabilises the knee joint in all planes."))
+        self.assertTrue(usable("The ACL, PCL, MCL, LCL are the four main ligaments of the knee joint."))
+        got = [s.text for s in sentences_for("Surgery was done. 12 ACL PCL MCL LCL tears were noted in the study.")]
+        self.assertEqual(got, ["Surgery was done.", "12 ACL PCL MCL LCL tears were noted in the study."])
+        # a real running head is still removed
+        got = [s.text for s in sentences_for("Rest is advised. 712 PATELLOFEMORAL DYSFUNCTION: NONOPERATIVE MANAGEMENT Ice may help.")]
+        self.assertEqual(got, ["Rest is advised.", "Ice may help."])
+
+    def test_this_test_and_an_empty_it_stand_on_their_own(self):
+        for text in ("This test is performed with the patient supine and the knee flexed to 90 degrees.",
+                     "This sign is positive when the patella is pushed laterally and the patient resists.",
+                     "This maneuver loads the patellofemoral joint in a position of flexion.",
+                     "It is important to measure both sides so that the findings can be compared.",
+                     "It is imperative to reduce irritating forces when the joint is swollen and painful."):
+            self.assertTrue(usable(text), text)
+
+    def test_other_this_these_it_and_however_sentences_still_lean_on_the_previous_one(self):
+        for text in ("This signals lateral patellar instability.", "This process ensures that treatment is tailored.",
+                     "This is a common finding in young athletes.", "These include modalities and rest.",
+                     "These tests are used to find the cause of pain.", "It is performed with the patient supine.",
+                     "It may also occur after surgery.", "However, the evidence is limited."):
+            self.assertFalse(usable(text), text)
+        self.assertTrue(usable("Items that follow are listed in the table, and Itching is not one of them."))
+
+    def test_title_case_runs_need_a_joining_word_to_count_as_a_heading(self):
+        for text in ("Magee Orthopedic Physical Assessment describes the test in detail for each joint.",
+                     "Anterior Cruciate Ligament Injury Prevention Programs reduce injury rates in athletes."):
+            self.assertTrue(usable(text), text)
+        for text in ("Common Impairments and Functional Limitations/Disabilities Impairments that may be associated "
+                     "with patellofemoral dysfunction include the following.",
+                     "Range of Motion and Flexibility Testing Protocols are described in this chapter for the knee."):
+            self.assertFalse(usable(text), text)
 
     def test_real_run_filters_out_exactly_the_noise(self):
         text = " ".join([RUN_ON, GLUED_HEADING, *QUESTIONS, *TITLE_HEADINGS, *DEPENDENT, *KEPT])

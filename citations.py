@@ -151,6 +151,15 @@ def render_citation_entry(hit: Dict[str, Any], index: Optional[int] = None) -> D
     }
 
 
+def selection_reply_usable(text: str) -> bool:
+    """
+    True when the model's source list can be read: it names at least one source
+    ("Source 3: 2, 4") or says there is no match. Anything else (chatter, an
+    empty reply) is a failure, not "no references".
+    """
+    return bool(re.search(r"Source\s*\d+", text or "", re.I)) or NO_REFERENCE_TEXT.lower() in (text or "").lower()
+
+
 def extract_source_sentences(
     text: str,
     sentence_counts: List[int],

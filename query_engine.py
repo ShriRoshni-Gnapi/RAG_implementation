@@ -30,7 +30,7 @@ from config import (
     get_qdrant_config,
 )
 from llm_client import LLMClient, LLMError, get_llm_client
-from summaries import parse_summary
+from summaries import CALL_FAILED_PREFIX, parse_summary, summary_failure
 from prompts import (
     MAX_SENTENCES_PER_SOURCE,
     SUMMARY_SYSTEM_PROMPT,
@@ -47,6 +47,7 @@ from passages import hit_text, sentences_for, split_text
 from citations import (
     build_reference_entries,
     extract_source_sentences,
+    selection_reply_usable,
     format_reference_list,
     validate_citations,
     render_citation_entry,
@@ -377,7 +378,7 @@ class PTQueryEngine:
                 max_tokens=SUMMARY_MAX_TOKENS,
             ).get("text", "")
         except LLMError as e:
-            return [], [{"paragraph": "", "reason": f"summary call failed: {type(e).__name__}"}], "", texts
+            return [], [{"paragraph": "", "reason": f"{CALL_FAILED_PREFIX}{type(e).__name__}"}], "", texts
         paragraphs, rejected = parse_summary(reply, texts)
         return paragraphs, rejected, reply, texts
 
@@ -442,6 +443,11 @@ class PTQueryEngine:
             raw_answer = gen.get("text", "")
             model = gen.get("model", model)
 
+        # A reply that is neither a source list nor "no match" is a failure, not "no references".
+        failures: List[str] = []
+        if hits and not selection_reply_usable(raw_answer):
+            failures.append("the model's source list could not be read")
+
         picks = extract_source_sentences(
             raw_answer, [len(s) for s in sentences], max_per_source=MAX_SENTENCES_PER_SOURCE)
         entries = build_reference_entries(hits, sentences, picks)
@@ -452,8 +458,14 @@ class PTQueryEngine:
                 (entry["summary"], notes, entry["summary_raw"],
                  entry["summary_passage"]) = self._summarize(entry, passages)
                 summary_notes.extend({"citation": n, **note} for note in notes)
+                problem = summary_failure(entry["summary"], notes)
+                if problem:
+                    failures.append(f"citation {n}: {problem}")
         return {
             "references": format_reference_list(entries, with_summary=summaries, summary_only=summary_only),
+            # Why this result is incomplete (fixed phrases and citation numbers only, never note text).
+            # A caller that stores results must not store one with failures.
+            "failures": failures,
             "summary_notes": summary_notes,
             "source_indices": sorted(i for i, p in picks.items() if p),
             "dropped_sources": sorted(i for i, p in picks.items() if not p),

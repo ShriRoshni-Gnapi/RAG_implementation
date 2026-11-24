@@ -38,7 +38,7 @@ class Sentence(NamedTuple):
         """
         return (self.complete and not self.heading
                 and not _QUESTION.search(self.text) and not _is_run_on(self.text)
-                and not _DEPENDENT_START.match(self.text))
+                and not _depends_on_previous(self.text))
 
 
 def hit_text(hit: Dict[str, Any]) -> str:
@@ -59,15 +59,22 @@ _CAPS_RUN = rf"(?:{_CAPS_TOKEN}\s+){{2,}}"
 _NUMBER_THEN_HEAD = re.compile(rf"(?:(?<=\s)|^)\d{{1,4}}\s+({_CAPS_RUN})")
 # "NONOPERATIVE MANAGEMENT 713" (number last)
 _HEAD_THEN_NUMBER = re.compile(rf"(?:(?<=\s)|^)({_CAPS_RUN})\d{{1,4}}(?=\s|$)")
-# A real running head has long words; this keeps "12 ACL PCL tears" intact.
+# A real running head is long and has at least one long word ("DYSFUNCTION").
+# A run of acronyms ("ACL PCL MCL LCL", 12 letters) has none, so it is text.
 _MIN_HEAD_LETTERS = 12
+_MIN_HEAD_WORD_LETTERS = 6
+
+
+def _is_head(run: str) -> bool:
+    """True for an ALL-CAPS run that reads as a running head, not a list of acronyms."""
+    lengths = [sum(c.isalpha() for c in word) for word in run.split()]
+    return sum(lengths) >= _MIN_HEAD_LETTERS and max(lengths, default=0) >= _MIN_HEAD_WORD_LETTERS
 
 
 def _mark_page_furniture(text: str) -> str:
     """Replace page number + running head by a page-break marker."""
     def drop(m: "re.Match[str]") -> str:
-        head = m.group(1)
-        return _PAGE_BREAK if sum(c.isalpha() for c in head) >= _MIN_HEAD_LETTERS else m.group(0)
+        return _PAGE_BREAK if _is_head(m.group(1)) else m.group(0)
 
     text = _NUMBER_THEN_HEAD.sub(drop, text)
     return _HEAD_THEN_NUMBER.sub(drop, text)
@@ -83,29 +90,51 @@ _CHAPTER_START = re.compile(r"^(?:CHAPTER|PART|SECTION|APPENDIX)\s+\w+\b")
 # A Title Case heading glued to the front of a sentence, with no punctuation
 # between: "Etiology of Symptoms The cause of ..." (a heading, then a sentence
 # starting "The") and "Common Impairments and Functional Limitations/Disabilities
-# Impairments that may ..." (four or more Title Case words, then lower case).
-# Three words ("The McConnell Test is ...") are left alone: test and
-# condition names are often written that way inside real sentences.
+# Impairments that may ..." (four or more Title Case words joined by a word such
+# as "and" or "of", then lower case). Without a joining word, a run of Title Case
+# words is a name inside a real sentence ("Magee Orthopedic Physical Assessment
+# describes ...", "Anterior Cruciate Ligament Injury Prevention Programs reduce
+# ..."), so it is left alone; so are three-word names ("The McConnell Test is ...").
 _TITLE_WORD = r"[A-Z][A-Za-z]+(?:/[A-Z][A-Za-z]+)?"
 _CONNECTOR = r"(?:of|and|in|for|to|on|with)"
 _SENTENCE_STARTERS = r"(?:The|A|An|In|It|This|These|When|If|During|There)"
 _HEADING_THEN_SENTENCE = re.compile(
     rf"^{_TITLE_WORD}\s+{_CONNECTOR}\s+{_TITLE_WORD}\s+{_SENTENCE_STARTERS}\s+[a-z]")
 _TITLE_RUN = re.compile(rf"^(?:{_TITLE_WORD}(?:\s+{_CONNECTOR})?\s+){{4,}}[a-z]")
+_JOINER = re.compile(rf"\s{_CONNECTOR}\s")
+
+
+def _is_title_heading(text: str) -> bool:
+    m = _TITLE_RUN.match(text)
+    return bool(m and _JOINER.search(m.group()[:-1]))
 
 
 def _has_heading(text: str) -> bool:
-    if _CHAPTER_START.match(text) or _HEADING_THEN_SENTENCE.match(text) or _TITLE_RUN.match(text):
+    if _CHAPTER_START.match(text) or _HEADING_THEN_SENTENCE.match(text) or _is_title_heading(text):
         return True
-    return any(sum(c.isalpha() for c in m.group()) >= _MIN_HEAD_LETTERS
-               for m in _CAPS_RUN_ANY.finditer(text))
+    return any(_is_head(m.group()) for m in _CAPS_RUN_ANY.finditer(text))
 
 
-# A sentence that begins "However", "This", "These" or "It" leans on the sentence
-# before it, so it is not offered on its own ("This signals lateral patellar
-# instability."). A real "It is ..." sentence is lost too; that is the price of
-# never printing a sentence whose subject the reader cannot see.
+# A sentence that begins "However", "This", "These" or "It" usually leans on the
+# sentence before it, so it is not offered on its own ("This signals lateral
+# patellar instability.", "These include treatment modalities ...", "It is
+# performed with the patient supine ..."). Two openings stand on their own and
+# are kept: "This test/sign/maneuver ..." (the citation names the test) and an
+# empty "It" with a clause after it ("It is important to measure both sides ...").
 _DEPENDENT_START = re.compile(r"^(?:However|This|These|It)\b")
+_SELF_CONTAINED_THIS = re.compile(
+    r"^This\s+(?:test|sign|maneuver|manoeuvre|procedure|technique|position|exercise|method|"
+    r"measurement|scale|score|classification|grade)\b")
+_EMPTY_IT = re.compile(
+    r"^It\s+(?:is|was|may be|can be|should be|must be)\s+(?:important|imperative|essential|necessary|"
+    r"critical|vital|useful|helpful|recommended|advisable|appropriate|difficult|possible|likely|"
+    r"unlikely|common)\s+(?:to|that)\b")
+
+
+def _depends_on_previous(text: str) -> bool:
+    if not _DEPENDENT_START.match(text):
+        return False
+    return not (_SELF_CONTAINED_THIS.match(text) or _EMPTY_IT.match(text))
 
 
 # --------------------------------------------------------------------------

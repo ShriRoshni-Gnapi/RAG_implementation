@@ -122,9 +122,17 @@ def references_response(result: Dict[str, Any]) -> ReferencesResponse:
     The caller's view of `find_references`: only citations that have a
     supported summary, with the fields below. Never the model's raw reply, the
     candidate list, or the notes and passage used to check the summaries.
+
+    "empty" means the lookup finished and found nothing supported (no relevant
+    passage, the model said INSUFFICIENT, or the checks rejected every
+    statement). A lookup that did not finish answers 503 instead.
     """
-    if any(n["reason"].startswith("summary call failed") for n in result["summary_notes"]):
-        raise HTTPException(status_code=503, detail="The reference service is unavailable (summary).")
+    if result["failures"]:
+        # An unusable model reply is a failure, never "empty": a caller that stores
+        # results would otherwise keep "no references" for a lookup that did not finish.
+        # The reasons are fixed phrases and citation numbers, so they are safe to log.
+        print("/references incomplete: " + "; ".join(result["failures"]), flush=True)
+        raise HTTPException(status_code=503, detail="The reference service is unavailable (incomplete model reply).")
     items = [
         ReferenceItem(
             book=e["book"], author=e["author"], chapter=e["chapter"], section=e["section"],

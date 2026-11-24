@@ -162,7 +162,15 @@ def run_reference_mode(path: str, top_k: int, json_mode: bool, summaries: bool =
         return 2
     res = PTQueryEngine(top_k=top_k).find_references(
         note, top_k=top_k, summaries=summaries, summary_only=summary_only)
-    print(json.dumps(res, indent=2, ensure_ascii=False) if json_mode else res["references"])
+    if json_mode:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    elif not res["failures"]:
+        print(res["references"])
+    if res["failures"]:
+        # Not "No matching reference was found": the lookup did not finish. Same rule as POST /references.
+        print("Incomplete result, the model's reply could not be used: " + "; ".join(res["failures"]),
+              file=sys.stderr)
+        return 1
     return 0
 
 

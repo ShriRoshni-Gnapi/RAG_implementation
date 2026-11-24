@@ -41,6 +41,14 @@ _CONCLUSION = re.compile(
     r"^(?:This|These)\b[^.]{0,60}?\b"
     r"(?:suggests?|means?|highlights?|ensures?|indicates?|implies|imply|emphasi[sz]es?|demonstrates?)\b")
 
+# Reasons a summary is missing. The first three mean the model's reply could not be
+# used, which is a failure to report, not "nothing relevant"; INSUFFICIENT and a
+# rejection by the checks are real answers.
+EMPTY_REPLY_REASON = "empty reply from the model"
+NO_EVIDENCE_REASON = "no valid sentence numbers"
+CALL_FAILED_PREFIX = "summary call failed: "
+INSUFFICIENT_REASON = "the model said the passage is insufficient"
+
 MIN_UNIT_CHARS = 25
 MIN_SHARED_STEMS = 2
 _STEM = 5
@@ -84,7 +92,7 @@ def _ungrounded_term(text: str, passage_words: set) -> Optional[str]:
 def _reject_reason(text: str, ids: List[int], sentences: List[str], passage: str,
                    passage_words: set, passage_numbers: set) -> Optional[str]:
     if not ids:
-        return "no valid sentence numbers"
+        return NO_EVIDENCE_REASON
     if len(text) < MIN_UNIT_CHARS:
         return "too short"
     if _CONCLUSION.match(text):
@@ -114,9 +122,9 @@ def parse_summary(reply: str, sentences: List[str]) -> Tuple[List[str], List[Dic
     reason, for debugging.
     """
     if not (reply or "").strip():
-        return [], [{"paragraph": "", "reason": "empty reply from the model"}]
+        return [], [{"paragraph": "", "reason": EMPTY_REPLY_REASON}]
     if reply.strip().upper().startswith(INSUFFICIENT_TEXT):
-        return [], [{"paragraph": "", "reason": "the model said the passage is insufficient"}]
+        return [], [{"paragraph": "", "reason": INSUFFICIENT_REASON}]
 
     passage = " ".join(sentences)
     passage_words = {w.lower() for w in _WORD.findall(passage)}
@@ -138,6 +146,25 @@ def parse_summary(reply: str, sentences: List[str]) -> Tuple[List[str], List[Dic
         if good:
             kept.append(" ".join(good))
     return kept, rejected
+
+
+def summary_failure(paragraphs: List[str], rejected: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Why a citation has no summary because the model's reply was unusable, or
+    None. That is: the call failed, the reply was empty, or no statement in it
+    carried a valid sentence number (the format was not followed at all).
+
+    "Insufficient" and statements the checks rejected are real answers, not
+    failures. A caller that stores results must not store a failure.
+    """
+    reasons = [r["reason"] for r in rejected]
+    if any(r.startswith(CALL_FAILED_PREFIX) for r in reasons):
+        return "call failed"
+    if EMPTY_REPLY_REASON in reasons:
+        return "empty reply"
+    if not paragraphs and reasons and all(r == NO_EVIDENCE_REASON for r in reasons):
+        return "reply without sentence numbers"
+    return None
 
 
 def _units(line: str) -> List[Tuple[str, str]]:
